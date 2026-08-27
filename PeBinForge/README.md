@@ -6,6 +6,8 @@ WHS4-PeBinForge는 Windows x86/x64 네이티브 PE와 .NET Framework 4 PE를 sel
 
 > 이 저장소는 WHS 4기 CTF 및 Windows 로더 구조 학습·검증을 목적으로 합니다. 본인이 소유하거나 명시적으로 허가받은 환경에서만 사용하세요.
 
+빌드 없이 사용할 수 있는 Windows 배포본과 SHA-256 검증 방법은 [`release/`](./release)에서 확인할 수 있습니다.
+
 ## 작동 원리
 
 ### EXE를 단순히 복사해서는 실행할 수 없는 이유
