@@ -1,0 +1,15 @@
+/build/
+*.obj
+*.pdb
+*.ilk
+*.pbfpriv
+*.pbfpub
+*.exe
+*.dll
+*.lib
+*.exp
+*.bin
+*.sha256
+*.sig
+.vs/
+.vscode/
