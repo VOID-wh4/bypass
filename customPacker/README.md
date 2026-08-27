@@ -1,76 +1,38 @@
-# cpacker-win — MBA-obfuscated executable packer (Windows / MinGW)
+> 문의사항은 @VeryBigsilver
 
-A minimal UPX-style packer for **Windows .exe** files. It compresses the target
-with deflate, hides the decompression with Mixed Boolean-Arithmetic (MBA)
-obfuscation, and unpacks + runs it at launch. Educational / RE study project.
+## packer
+압축 과정 중 MBA를 이용해서 난독화하는 패커
+-> 현재 정적 탐지만 우회됨
 
-## Files
-
-- `mathcrypt.h` — the math layer (shared with the Linux version). Byte-wise
-  affine cipher over Z/256 (`encode`) and its MBA-obfuscated inverse
-  (`decode_mba`), verified exhaustively over all 256 byte values.
-- `packer.c`   — build-time tool: deflate + encode the input, append to the stub.
-- `stub_win.c` — runtime loader using native Win32
-  (`GetModuleFileNameA`, `GetTempFileNameA`, `CreateProcessA`).
-- `miniz.c` / `miniz.h` — single-file zlib replacement, so there is **no
-  external library to install**. (from richgel999/miniz, MIT licensed)
-
-## Layout of a packed file
-
+## 사용법
+1. (추천) 각 환경에 맞춰 컴파일
+2. release에 있는 exe 파일 사용
 ```
-[ stub .exe ][ encoded+compressed payload ][ orig u64 ][ comp u64 ][ "MBApack!" ]
+packer.exe <아키텍쳐> <파일> <출력파일>
 ```
 
-The stub reads the 24-byte footer from the end of its own .exe to locate and
-restore the payload.
-
-## Build (MinGW-w64)
-
-```sh
-gcc -O2 -Wall stub_win.c miniz.c -o stub.exe
-gcc -O2 -Wall packer.c   miniz.c -o packer.exe
 ```
-
-No `-lz` needed — miniz is compiled in directly. (This is why the Linux
-`-lz` build failed under MinGW: MinGW ships no zlib. miniz removes that
-dependency entirely.)
-
-## Use
-
-```sh
-packer.exe stub.exe yourprogram.exe yourprogram_packed.exe
-yourprogram_packed.exe          # runs exactly like the original
+ex) packer.exe stub_win32 client.exe client_packed.exe
 ```
+### 컴파일
+```
+# packer
+gcc -O2 -Wall packer.c miniz.c -o packer.exe
 
-## How it runs
+# win64
+gcc -O2 -Wall stub_win64.c miniz.c -o stub.exe -Wl,--image-base,0x60000000
 
-1. The packed .exe *is* the stub with the payload appended.
-2. On launch the stub finds its own path, reads the footer, reads the payload.
-3. It DECODEs the payload (MBA affine inverse), then INFLATEs it (miniz).
-4. It writes the original .exe to `%TEMP%`, runs it with `CreateProcess`, waits,
-   forwards the exit code, and deletes the temp file.
+# win32 (mingw32 필요)
+i686-w64-mingw32-gcc -O2 -Wall stub_win32.c miniz.c -o stub.exe -Wl,--image-base,0x400000
 
-## What "obfuscated" means here
+# .net
+msvc x86창에서 build_net.bat 실행
 
-Only the stub ships, and the stub only runs `decode`. So `decode` is what an
-attacker disassembles — that's where the MBA lives. The clean affine inverse is
-four obvious instructions (`ror; xor; sub; imul`); the MBA version is ~30
-tangled `and/or/xor/add/shift` instructions with identical behavior.
+```
+참고) 패킹할 파일 만들 떄 gcc보다 msvc로 컴파일 하는게 훨씬 오류가 덜함
 
-## Known limitations (next steps)
-
-- The final `imul` (= A^{-1}) is still visible; a full MBA multiply hides it.
-- Byte-wise (Z/256) is weak — effectively a 256-entry substitution table.
-  Moving to 32-bit words (Z/2^32) is much stronger.
-- The MBA pattern is fixed => it has a signature. Randomizing per build defeats
-  pattern matching.
-- The stub drops the unpacked .exe to %TEMP%. A stealthier design would run it
-  from memory, but that is substantially more involved on Windows.
-- Antivirus heuristics flag self-unpacking stubs; this is expected for any
-  packer and is why real distribution uses signed, well-known packers.
-
-## Note on verification
-
-This was built and round-trip tested via MinGW-w64 cross-compilation and Wine
-(`packer.exe` → packed a test `victim.exe` → ran it → correct output). Behavior
-on real Windows should match, but do test on your target Windows version.
+## 주의사항
+패킹할 파일에 reloc 테이블이 있어야 합니다.
+```
+objdump -x <파일> | Select-String -Pattern "reloc" -Context 0,2
+```
