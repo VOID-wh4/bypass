@@ -6,8 +6,10 @@ Windows에서 정지 상태로 생성한 프로세스에 데이터를 기록하�
 
 | 파일 | 설명 |
 |---|---|
-| `process_injection.c` | `CreateProcessA`, `VirtualAllocEx`, `WriteProcessMemory`, `GetThreadContext`, `SetThreadContext`, `ResumeThread` 흐름을 포함한 원본 소스 코드 |
-| `process_injection.exe` | 위 소스의 Windows x64 빌드 결과물 |
+| `process_injection.c` | Donut으로 생성한 쉘코드 `client.bin`을 사용하는 버전의 소스 코드 |
+| `process_injection.exe` | Donut용 `process_injection.c`의 Windows x64 빌드 결과물 |
+| `process_injection_S.c` | 커스텀 쉘코드 `client_S.bin`을 사용하는 버전의 소스 코드 |
+| `process_injection_S.exe` | 커스텀 쉘코드용 `process_injection_S.c`의 Windows x64 빌드 결과물 |
 
 ## 동작 개요
 
@@ -30,4 +32,6 @@ Windows에서 정지 상태로 생성한 프로세스에 데이터를 기록하�
 ```text
 process_injection.c    E85AA329E690BF9A06BD5B9A079E5AFA9086F95C70014637F798B28A42E0A9C9
 process_injection.exe  84888E76572347BB8497FE923D654199970D119E65511663082B2CF110EFAE37
+process_injection_S.c  6EB37808F11C89F84ACE7724DFF86A990929B07E8A1C20D202EF1769594CD0F1
+process_injection_S.exe B29A64A7F71CC6C11EFD881BD19818CFEF04A4D58E30C0D5E535D2F6A3A0B04A
 ```
