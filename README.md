@@ -5,3 +5,10 @@ As part of the WHS 4rd Generation VOID team's research project on antivirus malw
 we have developed a custom loader capable of evading antivirus solutions. 
 Attached are the source code and associated files
 ```
+---
+## 포함된 우회기법
+- APCinjector (@tortoiese): 쉘코드 APC 인젝션
+- Manual PE mapper (@hackers458): PE 로더
+- PeBinForge (@hackers458): 쉘코드 생성기 및 로더
+- customPacker (@VeryBigsilver): MBA 항등식 패커
+- ipv4fuscation (@VeryBigsilver): 쉘코드 ipv4 난독화
