@@ -13,3 +13,4 @@ Attached are the source code and associated files
 - customPacker (@VeryBigsilver): MBA 항등식 패커
 - ipv4fuscation (@VeryBigsilver): 쉘코드 ipv4 난독화
 - ShellcodeLoader/XOR (@endusdksla): 쉘코드 로더 + XOR 암호화
+- In-Memory .NET Assembly Loader (@tjzln): XOR 기반 .NET 인메모리 로더
