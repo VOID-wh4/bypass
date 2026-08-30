@@ -31,7 +31,3 @@ Windows에서 정지 상태로 생성한 프로세스에 데이터를 기록하�
 process_injection.c    E85AA329E690BF9A06BD5B9A079E5AFA9086F95C70014637F798B28A42E0A9C9
 process_injection.exe  84888E76572347BB8497FE923D654199970D119E65511663082B2CF110EFAE37
 ```
-
-## 면책
-
-본 자료는 Windows 내부 동작과 보안 탐지 기법을 학습하기 위한 연구·교육용 자료입니다. 허가받지 않은 시스템이나 프로세스에 사용해서는 안 됩니다.
