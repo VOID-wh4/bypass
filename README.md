@@ -12,3 +12,4 @@ Attached are the source code and associated files
 - PeBinForge (@hackers458): 쉘코드 생성기 및 로더
 - customPacker (@VeryBigsilver): MBA 항등식 패커
 - ipv4fuscation (@VeryBigsilver): 쉘코드 ipv4 난독화
+- ShellcodeLoader/XOR (@endusdksla): 쉘코드 로더 + XOR 암호화
