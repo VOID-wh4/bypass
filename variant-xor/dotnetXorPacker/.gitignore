@@ -1,0 +1,15 @@
+.DS_Store
+Thumbs.db
+
+bin/
+obj/
+Debug/
+
+*.user
+*.suo
+*.cache
+*.log
+
+*.pdb
+
+inVM/
