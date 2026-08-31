@@ -25,13 +25,17 @@ NetCrypt 기반 .NET 패커 변형본.
 폴더 배치:
 
 ```
-netcrypt/
-├── netcrypt.sln
-├── netcrypt/
-├── SimplePacker/
-└── NetCryptCLI/
-    ├── NetCryptCLI.cs
-    └── NetCryptCLI.csproj
+dotnetXorPacker/
+├── NetCryptCLI.cs
+├── NetCryptCLI.csproj
+├── Packer.cs
+├── Resources.resx
+├── StubCode-resx.txt
+└── release/
+    └── NetCryptCLI-dotnet40/
+        ├── NetCryptCLI.exe
+        ├── NetCryptCLI.exe.config
+        └── netcrypt.dll
 ```
 
 ## CLI
@@ -75,4 +79,16 @@ NetCryptCLI 프로젝트 추가
 ```
 NetCryptCLI/NetCryptCLI.csproj
 netcrypt/netcrypt.csproj
+```
+
+## Release
+
+Windows 실행용 파일은 `release/NetCryptCLI-dotnet40/`에 정리.
+
+필수 파일:
+
+```
+NetCryptCLI.exe
+NetCryptCLI.exe.config
+netcrypt.dll
 ```
