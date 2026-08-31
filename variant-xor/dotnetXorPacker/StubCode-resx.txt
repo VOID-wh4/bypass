@@ -1,0 +1,180 @@
+using System;
+using System.Windows.Forms;
+using System.Security.Cryptography;
+using System.IO;
+using System.Reflection;
+using System.Collections.Generic;
+
+namespace stub
+{
+    static class Program
+    {
+        private const string key = "%KEY%";
+        private const string IV = "%IV%";
+        private const string xorKey = "%XORKEY%";
+        private const string GENERIC_ERROR = "Generic error while starting the application.";
+
+        private static readonly string[] payloadChunks = new string[]
+        {
+%CHUNKS%
+        };
+
+        private static Dictionary<string, byte[]> dependencies = new Dictionary<string, byte[]>();
+
+        private static string GetPayload()
+        {
+            int total = 0;
+            for (int i = 0; i < payloadChunks.Length; i++)
+            {
+                total += payloadChunks[i].Length;
+            }
+            char[] buf = new char[total];
+            int pos = 0;
+            for (int i = 0; i < payloadChunks.Length; i++)
+            {
+                payloadChunks[i].CopyTo(0, buf, pos, payloadChunks[i].Length);
+                pos += payloadChunks[i].Length;
+            }
+            return new string(buf);
+        }
+
+        private static byte[] Xor(byte[] data, byte[] xkey)
+        {
+            for (int i = 0; i < data.Length; i++)
+            {
+                data[i] = (byte)(data[i] ^ xkey[i % xkey.Length]);
+            }
+            return data;
+        }
+
+        private static string InnerMessage(Exception ex)
+        {
+            Exception current = ex;
+            while (current.InnerException != null)
+            {
+                current = current.InnerException;
+            }
+            return current.Message;
+        }
+
+        private static void Log(string msg)
+        {
+            try
+            {
+                File.AppendAllText(Path.Combine(Path.GetTempPath(), "ncstub.log"), DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine);
+            }
+            catch
+            {
+            }
+        }
+
+        private static Assembly ResolveAssembly(object sender, ResolveEventArgs args)
+        {
+            string simpleName = new AssemblyName(args.Name).Name;
+            byte[] data;
+            if (dependencies.TryGetValue(simpleName, out data))
+            {
+                return Assembly.Load(data);
+            }
+            return null;
+        }
+
+        [STAThread]
+        static void Main()
+        {
+            try
+            {
+                Log("v2 stub start");
+
+                byte[] app = Convert.FromBase64String(GetPayload());
+                Log("payload decoded, cipher len=" + app.Length);
+                app = Xor(app, Convert.FromBase64String(xorKey));
+
+                RijndaelManaged rijndael = new RijndaelManaged();
+                rijndael.KeySize = 256;
+                rijndael.Key = Convert.FromBase64String(key);
+                rijndael.IV = Convert.FromBase64String(IV);
+                rijndael.Padding = PaddingMode.ISO10126;
+                byte[] decrypted;
+                using (MemoryStream memoryStream = new MemoryStream())
+                using (CryptoStream cryptoStream = new CryptoStream(memoryStream, rijndael.CreateDecryptor(), CryptoStreamMode.Write))
+                {
+                    cryptoStream.Write(app, 0, app.Length);
+                    cryptoStream.FlushFinalBlock();
+                    decrypted = memoryStream.ToArray();
+                }
+                Log("decrypt ok, len=" + decrypted.Length);
+                if (decrypted.Length < 8)
+                {
+                    throw new Exception("Decrypted payload too small (" + decrypted.Length + " bytes). Key/IV mismatch or payload truncated.");
+                }
+
+                // ---- parse payload container ----
+                byte[] mainData;
+                int count = 0;
+                using (MemoryStream container = new MemoryStream(decrypted))
+                using (BinaryReader reader = new BinaryReader(container))
+                {
+                    try
+                    {
+                        count = reader.ReadInt32();
+                        if (count < 0 || count > 64)
+                        {
+                            throw new Exception("Unexpected container header (count=" + count + "). Packer and stub versions may not match.");
+                        }
+                        for (int i = 0; i < count; i++)
+                        {
+                            string depName = reader.ReadString();
+                            if (depName.Length == 0 || depName.Length > 512)
+                            {
+                                throw new Exception("Invalid dependency name at index " + i + " (len=" + depName.Length + ", position=" + container.Position + ").");
+                            }
+                            int dataLength = reader.ReadInt32();
+                            if (dataLength <= 0 || dataLength > container.Length - container.Position)
+                            {
+                                throw new Exception("Invalid dependency data length at index " + i + " (len=" + dataLength + ", position=" + container.Position + ", remaining=" + (container.Length - container.Position) + ").");
+                            }
+                            dependencies[depName] = reader.ReadBytes(dataLength);
+                        }
+                        int mainLength = reader.ReadInt32();
+                        if (mainLength <= 0 || container.Position + mainLength > container.Length)
+                        {
+                            throw new Exception("Invalid main assembly length (len=" + mainLength + ", position=" + container.Position + ", remaining=" + (container.Length - container.Position) + ").");
+                        }
+                        mainData = reader.ReadBytes(mainLength);
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        throw new Exception("Payload truncated while parsing container (count=" + count + ", position=" + container.Position + ", length=" + container.Length + "). Old packed output or packer/stub mismatch.");
+                    }
+                }
+                Log("container ok, count=" + count + ", main=" + mainData.Length);
+
+                AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
+
+                Assembly newAssembly = Assembly.Load(mainData);
+                Log("assembly loaded: " + newAssembly.FullName);
+
+                MethodInfo entryPoint = newAssembly.EntryPoint;
+                ParameterInfo[] parameters = entryPoint.GetParameters();
+                Log("entry point: " + entryPoint.Name + ", params=" + parameters.Length);
+                Log("invoking entry...");
+                if (parameters.Length == 0)
+                {
+                    entryPoint.Invoke(null, null);
+                }
+                else
+                {
+                    entryPoint.Invoke(null, new object[] { new string[0] });
+                }
+                Log("entry returned");
+            }
+            catch (Exception exz)
+            {
+                Log("ERROR: " + exz.ToString());
+                MessageBox.Show(GENERIC_ERROR + "\n\n" + InnerMessage(exz), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+        }
+    }
+}
