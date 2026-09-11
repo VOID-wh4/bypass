@@ -3,7 +3,6 @@
 ctf2.exe file quasar.bin --run
 
 
-&&
 ctf2.exe file mimikatz.bin --run
 
 
