@@ -8,10 +8,13 @@ NetCrypt 기반 .NET 패커 변형본.
 기존 NetCrypt에 다음 기능을 추가.
 
 - AES 암호화 이후 XOR 변환 추가
+- AES CBC 암·복호화 및 PKCS7 Padding 적용
 - `Main()` / `Main(string[] args)` 엔트리포인트 처리
 - 의존 DLL을 payload 컨테이너에 포함하는 CLI 경로 추가
-- 큰 payload를 `payloadChunks`로 분할
+- 암호화된 payload를 Netcrypt.Payload 리소스로 Stub에 임베드하고 payloadChunks 경로를 fallback으로 지원
+- 암호화 직후 복호화 결과를 원본 컨테이너와 비교하는 자기검증 추가
 - 컨테이너 헤더 검증용 `VerifyContainer()` 추가
+- 컴파일 후 payload 리소스 포함 여부 검증 및 임시 파일 정리
 - Stub 실행 단계와 예외 정보를 `%TEMP%/ncstub.log`에 기록
 - 별도 종료 모니터를 통해 payload 프로세스의 종료 코드 기록
 - 의존 어셈블리 로드 성공·실패 진단 보강
@@ -32,7 +35,7 @@ dotnetXorPacker/
 ├── NetCryptCLI.cs
 ├── NetCryptCLI.csproj
 ├── Packer.cs
-├── packed_final.exe
+├── client.exe
 ├── Resources.resx
 ├── StubCode-resx.txt
 └── release/
@@ -45,7 +48,7 @@ dotnetXorPacker/
 원본 솔루션에 반영한 뒤의 목표 배치:
 
 ```
-netcrypt/                       # 원본 솔루션 루트
+netcrypt/                   
 ├── netcrypt.sln
 ├── netcrypt/
 │   ├── netcrypt.csproj
@@ -86,7 +89,6 @@ NetCryptCLI.exe TestApp.exe TestApp_packed.exe
 - `NetCryptCLI.cs`: CLI 진입점
 - `NetCryptCLI.csproj`: CLI 프로젝트 파일
 
-`PackedClient.exe`는 저장소에서 제거하며, 필요한 실행 파일은 소스에서 직접 빌드합니다.
 
 ## 진단 로그
 

