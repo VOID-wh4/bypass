@@ -1,4 +1,4 @@
 # Quick Start
 
-### ghost process injection v2
-.\new_x64_memclr.exe --vxor .\cb.vxor 5A1F3C7E
+### ghost process injection
+.\new_x64_netghost.exe --vxor "C:\path\Client-built.vxor" 5A1F3C7E
