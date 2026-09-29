@@ -1,10 +1,8 @@
 # Ghost Process Injection
 ## Quick Start
 
-### Quasar
-.\new_x64_netghost.exe --vxor .\cb.vxor 5A1F3C7E
 ### mimikatz
-.\new_x64_netghost.exe --vxor .\mimi.vxor 5A1F3C7E
+.\ghost_chain_ctf_v5_interactive.exe
 
 privilege::debug 디버그 권한 휙득
 
