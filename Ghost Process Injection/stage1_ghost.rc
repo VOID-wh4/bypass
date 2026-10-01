@@ -1,0 +1,3 @@
+#include "stage1_resource.h"
+
+IDR_STAGE2_LOADER RCDATA "stage2_loader.baes"

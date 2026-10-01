@@ -1,0 +1,3 @@
+#include "stage2_resource.h"
+
+IDR_BENIGN_PAYLOAD RCDATA "mimi.vxor"
