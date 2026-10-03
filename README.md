@@ -15,3 +15,4 @@ Attached are the source code and associated files
 - ShellcodeLoader/XOR (@endusdksla): 쉘코드 로더 + XOR 암호화
 - In-Memory .NET Assembly Loader (@tjzln): XOR 기반 .NET 인메모리 로더
 - Ghost Process Injection (@endusdksla): 파일 삭제 대기 상태의 프로세스 생성
+- AMSI_hooking (@VeryBigsilver): 백신 dll 관련 후킹
