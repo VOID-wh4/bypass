@@ -4,7 +4,7 @@ encrypted.bin, ntdllhooking.exe가 있어야 합니다.
 ```
 ntdllhooking.exe powershell.exe <막을 dll>
 ```
-(기본적으로는 amsi.dll만 막습니다.) 
+(아무 dll을 입력하지 않을 경우 기본으로 amsi.dll을 막습니다.) 
 
 - bitdefender
     ```
@@ -25,7 +25,7 @@ ntdllhooking.exe powershell.exe <막을 dll>
     ```
 - kaspersky
     ```
-    ntdllhooking.exe powershell.exe
+    ntdllhooking.exe powershell.exe amsi.dll,antimalware_provider.dll
     ```
 - Avast
     ```
