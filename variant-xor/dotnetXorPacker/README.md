@@ -7,17 +7,17 @@ NetCrypt 기반 .NET 패커 변형본.
 
 기존 NetCrypt에 다음 기능을 추가.
 
-- AES 암호화 이후 XOR 변환 추가
-- AES CBC 암·복호화 및 PKCS7 Padding 적용
+- AES-256-CBC 암·복호화 및 PKCS7 Padding 적용
+- AES 암호화 이후 32바이트 키를 사용한 XOR 변환 추가
 - `Main()` / `Main(string[] args)` 엔트리포인트 처리
 - 의존 DLL을 payload 컨테이너에 포함하는 CLI 경로 추가
-- 암호화된 payload를 Netcrypt.Payload 리소스로 Stub에 임베드하고 payloadChunks 경로를 fallback으로 지원
+- 암호화된 payload를 `Netcrypt.Payload` 리소스로 Stub에 임베드
 - 암호화 직후 복호화 결과를 원본 컨테이너와 비교하는 자기검증 추가
-- 컨테이너 헤더 검증용 `VerifyContainer()` 추가
+- 컨테이너 내용 검증용 `VerifyContainer()` 추가
 - 컴파일 후 payload 리소스 포함 여부 검증 및 임시 파일 정리
-- Stub 실행 단계와 예외 정보를 `%TEMP%/ncstub.log`에 기록
-- 별도 종료 모니터를 통해 payload 프로세스의 종료 코드 기록
-- 의존 어셈블리 로드 성공·실패 진단 보강
+- payload 문자열 마커와 PE/CLR 헤더 식별 정보 변형
+- MSBuild 프로세스를 통한 payload 실행
+- 의존 어셈블리 메모리 로드 지원
 
 ## 사용법
 
@@ -35,7 +35,7 @@ dotnetXorPacker/
 ├── NetCryptCLI.cs
 ├── NetCryptCLI.csproj
 ├── Packer.cs
-├── client.exe
+├── Client.exe
 ├── Resources.resx
 ├── StubCode-resx.txt
 └── release/
@@ -81,19 +81,23 @@ NetCryptCLI.exe TestApp.exe TestApp_packed.exe TestLibrary.dll
 NetCryptCLI.exe TestApp.exe TestApp_packed.exe
 ```
 
+CLI는 `DotNetVersion.v4_0`으로 Stub을 컴파일합니다.
+의존 DLL은 파일명에서 경로와 확장자를 제외한 단순 어셈블리 이름으로 저장되므로
+같은 이름의 DLL을 중복 지정할 수 없습니다.
+
 ## 파일 설명
 
 - `Packer.cs`: 최종 패커 로직
 - `Resources.resx`: 최종 StubCode가 반영된 리소스 파일
-- `StubCode-resx.txt`: `Resources.resx`의 `StubCode` 값과 동기화된 StubCode 원문
+- `StubCode-resx.txt`: `Resources.resx`의 `StubCode` 확인·편집용 원문
 - `NetCryptCLI.cs`: CLI 진입점
-- `NetCryptCLI.csproj`: CLI 프로젝트 파일
+- `NetCryptCLI.csproj`: .NET Framework 4.0 CLI 프로젝트 파일
 
 
 ## 진단 로그
 
-생성된 Stub은 실행 단계, 의존 어셈블리 로드 결과, 처리되지 않은 예외와 종료 코드를
-`%TEMP%/ncstub.log`에 기록합니다.
+현재 생성된 Stub은 별도의 `%TEMP%/ncstub.log` 파일을 기록하지 않습니다.
+CLI에서 발생한 파일 입출력, 검증 및 컴파일 예외는 표준 오류 출력에 표시됩니다.
 
 ## 컴파일
 
@@ -111,6 +115,10 @@ NetCryptCLI 프로젝트 추가
 NetCryptCLI/NetCryptCLI.csproj
 netcrypt/netcrypt.csproj
 ```
+
+`NetCryptCLI.csproj`의 대상 프레임워크는 .NET Framework 4.0이며,
+현재 릴리스의 `NetCryptCLI.exe.config`는 .NET Framework 4.8 런타임을 지정합니다.
+생성된 Stub은 실행 시 Windows의 .NET Framework 4.x `MSBuild.exe`를 사용합니다.
 
 ## Release
 
